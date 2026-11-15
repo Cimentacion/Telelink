@@ -55,6 +55,10 @@ final class Dlna {
         return null;
     }
 
+    static boolean hasWifi(Context ctx) {
+        return wifi(ctx) != null;
+    }
+
     private static HttpURLConnection open(Context ctx, String url) throws IOException {
         Network n = wifi(ctx);
         URL u = new URL(url);

@@ -48,8 +48,9 @@ public class MainActivity extends Activity {
             + "<p>1. Escribe arriba la web o comparte un enlace desde otra app.</p>"
             + "<p>2. Dale al play del vídeo en la página.</p>"
             + "<p>3. Pulsa <b>Vídeos</b> y elige cuál mandar a la tele.</p>"
-            + "<p>El candado bloquea los saltos a otras webs (pop-ups y redirecciones). "
-            + "Actívalo cuando ya estés en la página de la peli.</p>"
+            + "<p>El candado se pone solo al cargar la página y bloquea los saltos a otras webs. "
+            + "Si un anuncio se come el toque, vuelve a pulsar el play. "
+            + "Quítalo si necesitas pasar a otra web.</p>"
             + "<p>Móvil y tele tienen que estar en la misma wifi.</p></body></html>";
 
     private WebView web;
@@ -65,6 +66,7 @@ public class MainActivity extends Activity {
     private Dlna.Device tv;
     private volatile String lockedDomain; // null = candado quitado
     private volatile String pageTitle = "Vídeo";
+    private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -247,6 +249,16 @@ public class MainActivity extends Activity {
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 if (url != null && url.startsWith("http")) urlBar.setText(url);
             }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (!autoLockPending || url == null || !url.startsWith("http")) return;
+                autoLockPending = false;
+                String host = Uri.parse(url).getHost();
+                if (host == null || isSearchEngine(host)) return;
+                // Candado automático: a partir de aquí la página no puede llevarte a otra web.
+                setLock(baseDomain(host));
+            }
         });
     }
 
@@ -263,6 +275,7 @@ public class MainActivity extends Activity {
         }
         // Navegación pedida por el usuario: el candado se quita para no bloquearla.
         setLock(null);
+        autoLockPending = true;
         videos.clear();
         refreshVideos();
         hideKeyboard();
@@ -292,7 +305,13 @@ public class MainActivity extends Activity {
         urlBar.clearFocus();
     }
 
+    private static boolean isSearchEngine(String host) {
+        String d = baseDomain(host);
+        return d.startsWith("duckduckgo.") || d.startsWith("google.") || d.startsWith("bing.");
+    }
+
     private void toggleLock() {
+        autoLockPending = false;
         if (lockedDomain != null) {
             setLock(null);
             toast("Candado quitado");
@@ -403,6 +422,16 @@ public class MainActivity extends Activity {
     }
 
     private void pickTv(final Runnable then) {
+        if (!Dlna.hasWifi(this)) {
+            new AlertDialog.Builder(this)
+                    .setTitle("El móvil no está en la wifi")
+                    .setMessage("Ahora mismo vas por datos móviles. Conecta el móvil a la misma wifi "
+                            + "que la tele y vuelve a intentarlo.")
+                    .setPositiveButton("Reintentar", (d, w) -> pickTv(then))
+                    .setNegativeButton("Cancelar", null)
+                    .show();
+            return;
+        }
         final AlertDialog wait = new AlertDialog.Builder(this)
                 .setMessage("Buscando teles en la wifi…")
                 .setCancelable(false)
