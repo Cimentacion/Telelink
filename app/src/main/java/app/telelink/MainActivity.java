@@ -2,8 +2,10 @@ package app.telelink;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -36,6 +38,10 @@ import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -77,6 +83,8 @@ public class MainActivity extends Activity {
     private volatile String currentPage = "";
     private String userAgent = "";
     private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
+    private static final String RELEASE = "https://github.com/Cimentacion/Telelink/releases/download/latest/";
+    private static final String INSTALL = "app.telelink.INSTALL";
     private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
@@ -87,6 +95,100 @@ public class MainActivity extends Activity {
         loadSavedTv();
         if (!handleIntent(getIntent())) {
             web.loadDataWithBaseURL(null, HOME, "text/html", "utf-8", null);
+        }
+        checkUpdate();
+    }
+
+    // ---------- Actualización automática ----------
+
+    private static HttpURLConnection get(String url) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(10000);
+        c.setReadTimeout(20000);
+        c.setInstanceFollowRedirects(true);
+        c.setUseCaches(false);
+        return c;
+    }
+
+    /** Al abrir la app mira si hay una compilación más nueva en GitHub. */
+    private void checkUpdate() {
+        new Thread(() -> {
+            try {
+                int mine = getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+                HttpURLConnection c = get(RELEASE + "version.txt");
+                if (c.getResponseCode() != 200) return;
+                byte[] buf = new byte[32];
+                InputStream in = c.getInputStream();
+                int n = in.read(buf);
+                in.close();
+                if (n <= 0) return;
+                final int remote = Integer.parseInt(new String(buf, 0, n, "UTF-8").trim());
+                if (remote <= mine) return;
+                ui.post(() -> {
+                    if (isFinishing()) return;
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("Hay una versión nueva")
+                            .setMessage("Tienes la " + mine + " y está disponible la " + remote + ".")
+                            .setPositiveButton("Actualizar", (d, w) -> downloadUpdate())
+                            .setNegativeButton("Ahora no", null)
+                            .show();
+                });
+            } catch (Exception ignored) {
+                // Sin conexión o sin versión publicada: se vuelve a mirar la próxima vez.
+            }
+        }, "telelink-update").start();
+    }
+
+    private void downloadUpdate() {
+        toast("Descargando la actualización…");
+        new Thread(() -> {
+            try {
+                HttpURLConnection c = get(RELEASE + "TeleLink.apk");
+                if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+                PackageInstaller installer = getPackageManager().getPackageInstaller();
+                PackageInstaller.SessionParams params =
+                        new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                int id = installer.createSession(params);
+                PackageInstaller.Session session = installer.openSession(id);
+                try {
+                    OutputStream out = session.openWrite("telelink.apk", 0, -1);
+                    InputStream in = c.getInputStream();
+                    byte[] buf = new byte[65536];
+                    int r;
+                    while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
+                    session.fsync(out);
+                    out.close();
+                    in.close();
+
+                    Intent back = new Intent(MainActivity.this, MainActivity.class).setAction(INSTALL);
+                    int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                            | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                    PendingIntent pi = PendingIntent.getActivity(MainActivity.this, 2, back, flags);
+                    session.commit(pi.getIntentSender());
+                } finally {
+                    session.close();
+                }
+            } catch (final Exception e) {
+                ui.post(() -> toast("No se pudo actualizar: " + e.getMessage()));
+            }
+        }, "telelink-download").start();
+    }
+
+    /** Android devuelve aquí el resultado de la instalación; lo normal es que pida confirmación. */
+    private void onInstallResult(Intent intent) {
+        int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirm != null) {
+                try {
+                    startActivity(confirm);
+                } catch (Exception e) {
+                    toast("No se pudo abrir el instalador");
+                }
+            }
+        } else if (status != PackageInstaller.STATUS_SUCCESS) {
+            String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+            toast("Actualización cancelada" + (msg == null ? "" : ": " + msg));
         }
     }
 
@@ -306,6 +408,10 @@ public class MainActivity extends Activity {
 
     private boolean handleIntent(Intent intent) {
         if (intent == null) return false;
+        if (INSTALL.equals(intent.getAction())) {
+            onInstallResult(intent);
+            return false;
+        }
         String url = null;
         if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
             url = intent.getData().toString();
