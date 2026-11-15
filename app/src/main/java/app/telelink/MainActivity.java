@@ -4,9 +4,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -29,12 +31,17 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
@@ -66,6 +73,10 @@ public class MainActivity extends Activity {
     private Dlna.Device tv;
     private volatile String lockedDomain; // null = candado quitado
     private volatile String pageTitle = "Vídeo";
+    private final Map<String, Map<String, String>> videoHeaders = new ConcurrentHashMap<>();
+    private volatile String currentPage = "";
+    private String userAgent = "";
+    private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
     private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
@@ -200,6 +211,9 @@ public class MainActivity extends Activity {
         s.setSupportMultipleWindows(true);
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
+        // Quita la marca de WebView del User-Agent: hay reproductores que se niegan si la ven.
+        userAgent = s.getUserAgentString().replace("; wv", "").replaceAll("Version/\\d+\\.\\d+ ", "");
+        s.setUserAgentString(userAgent);
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -227,7 +241,11 @@ public class MainActivity extends Activity {
                     return new WebResourceResponse("text/plain", "utf-8",
                             new ByteArrayInputStream(new byte[0]));
                 }
-                if (isVideo(u)) addVideo(u.toString());
+                if (isVideo(u)) {
+                    Map<String, String> h = request.getRequestHeaders();
+                    videoHeaders.put(u.toString(), h == null ? new HashMap<>() : new HashMap<>(h));
+                    addVideo(u.toString());
+                }
                 return null;
             }
 
@@ -247,7 +265,10 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                if (url != null && url.startsWith("http")) urlBar.setText(url);
+                if (url != null && url.startsWith("http")) {
+                    urlBar.setText(url);
+                    currentPage = url;
+                }
             }
 
             @Override
@@ -277,6 +298,7 @@ public class MainActivity extends Activity {
         setLock(null);
         autoLockPending = true;
         videos.clear();
+        videoHeaders.clear();
         refreshVideos();
         hideKeyboard();
         web.loadUrl(url);
@@ -392,7 +414,7 @@ public class MainActivity extends Activity {
         for (int i = 0; i < items.length; i++) items[i] = label(snapshot.get(i));
         new AlertDialog.Builder(this)
                 .setTitle("Mandar a la tele")
-                .setItems(items, (d, which) -> send(snapshot.get(which)))
+                .setItems(items, (d, which) -> chooseMode(snapshot.get(which)))
                 .setNeutralButton("Vaciar lista", (d, w) -> {
                     videos.clear();
                     refreshVideos();
@@ -464,24 +486,109 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void send(final String url) {
+    private void chooseMode(final String url) {
+        String[] modes = {
+                "Automático (recomendado)",
+                "Modo compatible\nSi la tele da error o se queda en negro",
+                "Directo\nSin pasar por el móvil"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Cómo enviarlo")
+                .setItems(modes, (d, which) -> send(url, which))
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    /** Cabeceras con las que el navegador pidió el vídeo; el puente las repite ante la web. */
+    private Map<String, String> headersFor(String url) {
+        Map<String, String> h = new HashMap<>();
+        Map<String, String> seen = videoHeaders.get(url);
+        if (seen != null) h.putAll(seen);
+        boolean referer = false, agent = false;
+        for (String k : h.keySet()) {
+            if (k.equalsIgnoreCase("Referer")) referer = true;
+            if (k.equalsIgnoreCase("User-Agent")) agent = true;
+        }
+        if (!referer && currentPage.startsWith("http")) h.put("Referer", currentPage);
+        if (!agent && !userAgent.isEmpty()) h.put("User-Agent", userAgent);
+        return h;
+    }
+
+    private void startBridgeService() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+        }
+        Intent i = new Intent(this, BridgeService.class);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+            else startService(i);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void stopBridgeService() {
+        try {
+            startService(new Intent(this, BridgeService.class).setAction(BridgeService.STOP));
+        } catch (Exception ignored) {
+            Bridge.stop();
+        }
+    }
+
+    private void send(final String url, final int mode) {
         if (tv == null) {
-            pickTv(() -> send(url));
+            pickTv(() -> send(url, mode));
             return;
         }
         final Dlna.Device target = tv;
         final String title = pageTitle;
+        final Map<String, String> headers = headersFor(url);
+        if (mode != DIRECT) startBridgeService();
         toast("Enviando a " + target.name + "…");
         io.execute(() -> {
             try {
-                Dlna.play(MainActivity.this, target, url, title);
-                ui.post(() -> toast("Reproduciendo en " + target.name));
+                String how;
+                if (mode == DIRECT) {
+                    Dlna.play(MainActivity.this, target, url, title, null);
+                    how = "directo";
+                } else {
+                    String ip = Dlna.wifiIp(MainActivity.this);
+                    if (ip == null) throw new IOException("El móvil no está en la wifi.");
+                    int port = Bridge.start();
+                    String id = Bridge.register(url, headers);
+                    Bridge.Probe p = Bridge.probe(id);
+                    if (p.code >= 400) {
+                        throw new IOException("La web no entrega este vídeo (HTTP " + p.code + "). "
+                                + "Recarga la página, dale al play otra vez y elige el vídeo nuevo de la lista.");
+                    }
+                    String base = "http://" + ip + ":" + port;
+                    String ts = base + "/ts/" + id + "/stream.ts";
+                    if (!p.hls) {
+                        String mime = p.type != null && p.type.startsWith("video/") ? p.type : "video/mp4";
+                        Dlna.play(MainActivity.this, target, base + "/p/" + id + "/video.mp4", title, mime);
+                        how = "puente";
+                    } else if (mode == COMPAT) {
+                        Dlna.play(MainActivity.this, target, ts, title, "video/mpeg");
+                        how = "compatible";
+                    } else {
+                        try {
+                            Dlna.play(MainActivity.this, target, base + "/p/" + id + "/index.m3u8", title,
+                                    "application/vnd.apple.mpegurl");
+                            how = "puente";
+                        } catch (IOException rejected) {
+                            Dlna.play(MainActivity.this, target, ts, title, "video/mpeg");
+                            how = "compatible";
+                        }
+                    }
+                }
+                final String h = how;
+                ui.post(() -> toast("Enviado a " + target.name + " (" + h + ")"));
             } catch (final Exception e) {
                 ui.post(() -> new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("La tele no lo ha aceptado")
-                        .setMessage(e.getMessage()
-                                + "\n\nPrueba con otro vídeo de la lista o busca la tele otra vez.")
-                        .setPositiveButton("Buscar tele", (d, w) -> pickTv(() -> send(url)))
+                        .setTitle("No se ha podido enviar")
+                        .setMessage(String.valueOf(e.getMessage()))
+                        .setPositiveButton("Modo compatible", (d, w) -> send(url, COMPAT))
+                        .setNeutralButton("Buscar tele", (d, w) -> pickTv(() -> send(url, mode)))
                         .setNegativeButton("Cerrar", null)
                         .show());
             }
@@ -526,11 +633,24 @@ public class MainActivity extends Activity {
         addRemote(r2, "Vol +", d -> "Volumen " + Dlna.volumeBy(this, d, 3));
         addRemote(r2, "+5 min", d -> { Dlna.seekBy(this, d, 300); return null; });
 
-        addRemote(r3, "Parar", d -> { Dlna.stop(this, d); return "Parado"; });
+        addRemote(r3, "Parar", d -> {
+            ui.post(this::stopBridgeService);
+            Dlna.stop(this, d);
+            return "Parado";
+        });
+
+        // Diagnóstico: si la tele no pide nada al móvil, el contador se queda en 0.
+        TextView diag = new TextView(this);
+        diag.setPadding(dp(4), dp(10), dp(4), 0);
+        diag.setTextSize(12);
+        String err = Bridge.lastError;
+        diag.setText("Peticiones de la tele al móvil: " + Bridge.hits.get()
+                + (err == null || err.isEmpty() ? "" : "\nÚltimo error: " + err));
 
         box.addView(r1);
         box.addView(r2);
         box.addView(r3);
+        box.addView(diag);
 
         new AlertDialog.Builder(this)
                 .setTitle(tv == null ? "Mando (sin tele)" : "Mando · " + tv.name)

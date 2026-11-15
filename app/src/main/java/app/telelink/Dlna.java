@@ -2,6 +2,8 @@ package app.telelink;
 
 import android.content.Context;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
@@ -13,6 +15,7 @@ import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.HttpURLConnection;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
 import java.net.URL;
@@ -57,6 +60,23 @@ final class Dlna {
 
     static boolean hasWifi(Context ctx) {
         return wifi(ctx) != null;
+    }
+
+    /** IP del móvil en la wifi, que es la que la tele usará para llegar al puente. */
+    static String wifiIp(Context ctx) {
+        try {
+            Network n = wifi(ctx);
+            if (n == null) return null;
+            ConnectivityManager cm =
+                    (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            LinkProperties lp = cm.getLinkProperties(n);
+            if (lp == null) return null;
+            for (LinkAddress a : lp.getLinkAddresses()) {
+                if (a.getAddress() instanceof Inet4Address) return a.getAddress().getHostAddress();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private static HttpURLConnection open(Context ctx, String url) throws IOException {
@@ -209,13 +229,13 @@ final class Dlna {
 
     // ---------- Acciones ----------
 
-    static void play(Context ctx, Device d, String url, String title) throws IOException {
+    static void play(Context ctx, Device d, String url, String title, String mime) throws IOException {
         try {
             soap(ctx, d.avControl, AVT, "Stop", "<InstanceID>0</InstanceID>");
         } catch (IOException ignored) {
         }
 
-        String mime = mimeFor(url);
+        if (mime == null) mime = mimeFor(url);
         String didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" "
                 + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
                 + "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
