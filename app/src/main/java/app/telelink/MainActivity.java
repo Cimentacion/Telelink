@@ -741,7 +741,7 @@ public class MainActivity extends Activity {
                     return new WebResourceResponse("text/plain", "utf-8",
                             new ByteArrayInputStream(new byte[0]));
                 }
-                if (isVideo(u)) {
+                if (isVideo(u) || isMediaRequest(request)) {
                     Map<String, String> h = request.getRequestHeaders();
                     videoHeaders.put(u.toString(), h == null ? new HashMap<>() : new HashMap<>(h));
                     addVideo(u.toString());
@@ -797,6 +797,8 @@ public class MainActivity extends Activity {
                     addHistory(view.getTitle(), url);
                     view.evaluateJavascript(COMPAT_JS, null); // por si el móvil no admite inyectar al inicio
                     ui.postDelayed(() -> snap(), 2500);
+                    ui.postDelayed(() -> findVideos(), 2000);
+                    ui.postDelayed(() -> findVideos(), 6000);
                     final String at = url;
                     ui.postDelayed(() -> zoomCaptcha(at), 1200);
                     ui.postDelayed(() -> zoomCaptcha(at), 4000);
@@ -963,6 +965,73 @@ public class MainActivity extends Activity {
         p = p.toLowerCase(Locale.US);
         return p.endsWith(".m3u8") || p.endsWith(".mp4") || p.endsWith(".webm")
                 || p.endsWith(".mkv") || p.endsWith(".mov");
+    }
+
+    /**
+     * Vídeos cuya dirección no acaba en .mp4 (ok.ru y otras): se reconocen porque el reproductor
+     * los pide "a trozos" (cabecera Range), cosa que no se hace con imágenes ni scripts.
+     */
+    private static boolean isMediaRequest(WebResourceRequest r) {
+        try {
+            if (r.isForMainFrame() || !"GET".equalsIgnoreCase(r.getMethod())) return false;
+            Map<String, String> h = r.getRequestHeaders();
+            if (h == null) return false;
+            String range = null;
+            for (Map.Entry<String, String> e : h.entrySet()) {
+                if ("range".equalsIgnoreCase(e.getKey())) range = e.getValue();
+            }
+            if (range == null || !range.startsWith("bytes=")) return false;
+            String p = r.getUrl().getPath();
+            p = p == null ? "" : p.toLowerCase(Locale.US);
+            int dot = p.lastIndexOf('.');
+            String ext = dot >= 0 && dot > p.lastIndexOf('/') ? p.substring(dot + 1) : "";
+            switch (ext) {
+                case "js": case "css": case "png": case "jpg": case "jpeg": case "gif": case "webp":
+                case "svg": case "ico": case "woff": case "woff2": case "ttf": case "json": case "html":
+                case "htm": case "pdf": case "mp3": case "m4a": case "ogg": case "wav": case "vtt":
+                case "srt": case "ts": case "m4s":
+                    return false;
+                default:
+                    return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Busca vídeos en la propia página: el <video> que esté puesto y, en ok.ru, la lista de
+     * calidades que la página trae guardada. Devuelve sus direcciones.
+     */
+    private static final String FIND_JS = "(function(){var out=[];function add(u){try{if(u){"
+            + "u=new URL(u,location.href).href;if(/^https?:/.test(u)&&out.indexOf(u)<0)out.push(u);}}catch(e){}}"
+            + "try{document.querySelectorAll('video,video source').forEach(function(v){"
+            + "add(v.currentSrc);add(v.getAttribute('src'));});}catch(e){}"
+            + "try{document.querySelectorAll('[data-options]').forEach(function(e){try{"
+            + "var o=JSON.parse(e.getAttribute('data-options'));var m=o.flashvars&&o.flashvars.metadata;"
+            + "if(typeof m==='string')m=JSON.parse(m);if(m){(m.videos||[]).forEach(function(v){add(v.url);});"
+            + "add(m.hlsManifestUrl);}}catch(x){}});}catch(e){}"
+            + "try{document.querySelectorAll('[data-video]').forEach(function(e){try{"
+            + "add(JSON.parse(e.getAttribute('data-video')).videoSrc);}catch(x){}});}catch(e){}"
+            + "return JSON.stringify(out.slice(0,12));})()";
+
+    private void findVideos() {
+        final String url = currentPage;
+        if (!url.startsWith("http")) return;
+        try {
+            web.evaluateJavascript(FIND_JS, v -> {
+                if (!url.equals(currentPage) || v == null) return;
+                try {
+                    JSONArray found = new JSONArray(new JSONArray("[" + v + "]").getString(0));
+                    for (int i = 0; i < found.length(); i++) {
+                        String u = found.optString(i);
+                        if (u.startsWith("http")) addVideo(u);
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+        } catch (Exception ignored) {
+        }
     }
 
     private void addVideo(final String url) {
@@ -1551,6 +1620,7 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             snap();
+            if (resumed) findVideos();
             ui.postDelayed(this, 10000);
         }
     };
