@@ -31,3 +31,8 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 }
+
+dependencies {
+    // Solo para quitar la cabecera X-Requested-With que delata a la app ante las webs.
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

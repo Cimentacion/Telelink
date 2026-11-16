@@ -48,6 +48,9 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.webkit.WebSettingsCompat;
+import androidx.webkit.WebViewFeature;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -60,6 +63,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -631,6 +635,14 @@ public class MainActivity extends Activity {
         // Quita la marca de WebView del User-Agent: hay reproductores que se niegan si la ven.
         userAgent = s.getUserAgentString().replace("; wv", "").replaceAll("Version/\\d+\\.\\d+ ", "");
         s.setUserAgentString(userAgent);
+        // Sin esto cada petición lleva "X-Requested-With: app.telelink" y hay webs que por eso
+        // rechazan los formularios (el captcha se pasa, pero te devuelven a la misma página).
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, Collections.<String>emptySet());
+            }
+        } catch (Throwable ignored) {
+        }
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -646,7 +658,35 @@ public class MainActivity extends Activity {
 
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message msg) {
-                return false; // pop-up bloqueado
+                if (!isUserGesture || msg == null || !(msg.obj instanceof WebView.WebViewTransport)) return false;
+                // El pop-up se "abre" en una ventana que no se ve y que no carga nada: la página cree
+                // que su anuncio ha salido (si no, hay webs que no dejan seguir) y tú no lo ves.
+                try {
+                    final WebView ghost = new WebView(MainActivity.this);
+                    ghost.setWebViewClient(new WebViewClient() {
+                        @Override
+                        public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                            return true;
+                        }
+
+                        @Override
+                        public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                            return new WebResourceResponse("text/plain", "utf-8",
+                                    new ByteArrayInputStream(new byte[0]));
+                        }
+                    });
+                    ((WebView.WebViewTransport) msg.obj).setWebView(ghost);
+                    msg.sendToTarget();
+                    ui.postDelayed(() -> {
+                        try {
+                            ghost.destroy();
+                        } catch (Exception ignored) {
+                        }
+                    }, 4000);
+                    return true;
+                } catch (Exception e) {
+                    return false;
+                }
             }
         });
 
@@ -654,7 +694,7 @@ public class MainActivity extends Activity {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri u = request.getUrl();
-                if (AdBlock.isAd(u.getHost())) {
+                if (!adsAllowed && AdBlock.isAd(u.getHost())) {
                     return new WebResourceResponse("text/plain", "utf-8",
                             new ByteArrayInputStream(new byte[0]));
                 }
@@ -675,7 +715,7 @@ public class MainActivity extends Activity {
                     return true;
                 }
                 if (!scheme.equals("http") && !scheme.equals("https")) return true; // intent://, market://...
-                if (AdBlock.isAd(u.getHost())) return true;
+                if (AdBlock.isAd(u.getHost()) && (!adsAllowed || request.isForMainFrame())) return true;
                 if (request.isForMainFrame() && currentPage.isEmpty()) {
                     go(u.toString());
                     return true;
@@ -698,6 +738,8 @@ public class MainActivity extends Activity {
                     urlBar.setText(url);
                     currentPage = url;
                     captchaZoomed = "";
+                    adsAllowed = getSharedPreferences("noblock", MODE_PRIVATE)
+                            .getBoolean(baseDomain(Uri.parse(url).getHost()), false);
                 }
             }
 
@@ -728,6 +770,7 @@ public class MainActivity extends Activity {
             + "var w=window.visualViewport?window.visualViewport.width:window.innerWidth;"
             + "return 0.75*w/r.width;}catch(x){return 0;}})()";
     private String captchaZoomed = "";
+    private volatile boolean adsAllowed; // el usuario ha quitado el bloqueo de anuncios en esta web
 
     /**
      * Las webs con diseño de ordenador salen en miniatura y el captcha no hay quien lo toque:
@@ -1657,7 +1700,8 @@ public class MainActivity extends Activity {
                 fav ? "★ Quitar de favoritos" : "☆ Añadir a favoritos",
                 "Favoritos",
                 "Historial",
-                "Guardar clip de esta página"
+                "Guardar clip de esta página",
+                adsAllowed ? "Volver a bloquear anuncios en esta web" : "Quitar bloqueo de anuncios en esta web"
         };
         new AlertDialog.Builder(this)
                 .setItems(items, (d, which) -> {
@@ -1686,8 +1730,17 @@ public class MainActivity extends Activity {
                         showList("favorites", "Favoritos", false);
                     } else if (which == 4) {
                         showList("history", "Historial", false);
-                    } else {
+                    } else if (which == 5) {
                         saveCurrentClip();
+                    } else if (!page) {
+                        toast("Abre primero una web");
+                    } else {
+                        String domain = baseDomain(Uri.parse(url).getHost());
+                        boolean off = !adsAllowed;
+                        getSharedPreferences("noblock", MODE_PRIVATE).edit().putBoolean(domain, off).apply();
+                        adsAllowed = off;
+                        toast(off ? "Anuncios permitidos en " + domain : "Anuncios bloqueados en " + domain);
+                        web.reload();
                     }
                 })
                 .show();
