@@ -440,6 +440,31 @@ public class MainActivity extends Activity {
         if (grid) h.append("</div>");
     }
 
+    /**
+     * Busca vídeos de ok.ru. Se hace con el buscador (limitado a ok.ru) porque la búsqueda propia
+     * de ok.ru no admite que se le pase el texto en la dirección.
+     */
+    private void searchOkru(String q) {
+        String t = q == null ? "" : q.trim();
+        if (t.isEmpty()) {
+            toast("Escribe qué quieres buscar");
+            return;
+        }
+        go("https://duckduckgo.com/?q=" + Uri.encode(t + " site:ok.ru inurl:video"));
+    }
+
+    private void askOkru() {
+        final EditText in = new EditText(this);
+        in.setHint("Naruto 1, una peli…");
+        in.setSingleLine(true);
+        new AlertDialog.Builder(this)
+                .setTitle("Buscar vídeos en ok.ru")
+                .setView(in)
+                .setPositiveButton("Buscar", (d, w) -> searchOkru(in.getText().toString()))
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
     /** Botones de la portada: borrar todos los recientes o quitar uno. */
     private void homeAction(Uri u) {
         if ("clear".equals(u.getHost())) {
@@ -451,6 +476,8 @@ public class MainActivity extends Activity {
                     })
                     .setNegativeButton("Cancelar", null)
                     .show();
+        } else if ("okru".equals(u.getHost())) {
+            searchOkru(u.getQueryParameter("q"));
         } else if ("remove".equals(u.getHost())) {
             String target = u.getQueryParameter("u");
             JSONArray a = loadList("history");
@@ -474,6 +501,10 @@ public class MainActivity extends Activity {
                 .append("a.c{display:block;background:#171c26;border-radius:12px;padding:12px 14px;margin:0 0 8px;")
                 .append("text-decoration:none;color:#e6e9ef}a.c b{display:block;font-weight:600;white-space:nowrap;")
                 .append("overflow:hidden;text-overflow:ellipsis}a.c span{color:#8b93a3;font-size:13px}")
+                .append("form.s{display:flex;gap:8px;margin:18px 0 0}form.s input{flex:1;min-width:0;background:#171c26;")
+                .append("border:0;border-radius:12px;padding:13px 14px;color:#e6e9ef;font-size:16px;outline:none}")
+                .append("form.s button{background:#3ddc97;color:#0f1218;border:0;border-radius:12px;padding:0 18px;")
+                .append("font-size:15px;font-weight:600}")
                 .append("h3 a{float:right;color:#3ddc97;text-decoration:none;text-transform:none;letter-spacing:0;")
                 .append("font-weight:normal;padding:0 2px}")
                 .append(".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}")
@@ -489,7 +520,10 @@ public class MainActivity extends Activity {
                 .append("</style></head><body><h1>TeleLink</h1><p class='s'>Del móvil a la tele, sin anuncios.</p>")
                 .append("<ol><li>Abre una web y dale al play.</li>")
                 .append("<li>Pulsa el botón verde <b>Enviar a la tele</b>.</li>")
-                .append("<li>Controla la peli desde <b>Mando</b>.</li></ol>");
+                .append("<li>Controla la peli desde <b>Mando</b>.</li></ol>")
+                .append("<form class='s' action='telelink://okru' method='get'>")
+                .append("<input name='q' placeholder='Buscar vídeos en ok.ru' autocomplete='off'>")
+                .append("<button>Buscar</button></form>");
         cards(h, "Favoritos", "favorites", 12, false);
         cards(h, "Recientes", "history", 6, true);
         h.append("</body></html>");
@@ -1762,7 +1796,8 @@ public class MainActivity extends Activity {
                 "Historial",
                 "Guardar clip de esta página",
                 adsAllowed ? "Volver a bloquear anuncios en esta web" : "Quitar bloqueo de anuncios en esta web",
-                "Duplicar pantalla en la tele (opcional)"
+                "Duplicar pantalla en la tele (opcional)",
+                "Buscar vídeos en ok.ru"
         };
         new AlertDialog.Builder(this)
                 .setItems(items, (d, which) -> {
@@ -1795,6 +1830,8 @@ public class MainActivity extends Activity {
                         saveCurrentClip();
                     } else if (which == 7) {
                         mirror();
+                    } else if (which == 8) {
+                        askOkru();
                     } else if (!page) {
                         toast("Abre primero una web");
                     } else {
