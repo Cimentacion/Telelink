@@ -780,22 +780,45 @@ public class MainActivity extends Activity {
         btnVideos.setText("Midiendo…");
         withInfos(() -> {
             refreshVideos();
-            final List<String> snapshot = ranked();
-            if (snapshot.isEmpty()) return;
-            boolean known = score(snapshot.get(0)) > 0;
-            String[] items = new String[snapshot.size()];
-            for (int i = 0; i < items.length; i++) items[i] = label(snapshot.get(i), known && i == 0);
-            new AlertDialog.Builder(MainActivity.this)
-                    .setTitle("Mandar a la tele (el ★ es el más largo)")
-                    .setItems(items, (d, which) -> chooseMode(snapshot.get(which)))
-                    .setNeutralButton("Vaciar lista", (d, w) -> {
-                        videos.clear();
-                        infos.clear();
-                        refreshVideos();
-                    })
-                    .setNegativeButton("Cancelar", null)
-                    .show();
+            showVideoList(false);
         });
+    }
+
+    /** Relleno: no disponible, o mucho más pequeño que el vídeo principal (anuncios, blank.mp4...). */
+    private boolean isFiller(String url, long top) {
+        Bridge.Info i = infos.get(url);
+        if (i == null) return false;      // sin medir: no se puede juzgar, se muestra
+        if (i.code >= 400) return true;
+        long sc = score(url);
+        return top > 0 && sc > 0 && sc * 10 < top;
+    }
+
+    private void showVideoList(final boolean all) {
+        final List<String> rankedAll = ranked();
+        if (rankedAll.isEmpty()) return;
+        final long top = score(rankedAll.get(0));
+        final List<String> snapshot = new ArrayList<>();
+        for (String v : rankedAll) {
+            if (all || !isFiller(v, top)) snapshot.add(v);
+        }
+        if (snapshot.isEmpty()) snapshot.addAll(rankedAll);
+        final int hidden = rankedAll.size() - snapshot.size();
+
+        String[] items = new String[snapshot.size()];
+        for (int i = 0; i < items.length; i++) items[i] = label(snapshot.get(i), top > 0 && i == 0);
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle("Mandar a la tele")
+                .setItems(items, (d, which) -> chooseMode(snapshot.get(which)))
+                .setNeutralButton("Vaciar lista", (d, w) -> {
+                    videos.clear();
+                    infos.clear();
+                    refreshVideos();
+                })
+                .setNegativeButton("Cancelar", null);
+        if (hidden > 0) {
+            b.setPositiveButton("Ver " + hidden + " de relleno", (d, w) -> showVideoList(true));
+        }
+        b.show();
     }
 
     // ---------- Tele ----------
