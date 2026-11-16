@@ -1229,7 +1229,13 @@ public class MainActivity extends Activity {
                     if (ip == null) throw new IOException("El móvil no está en la wifi.");
                     int port = Bridge.start();
                     String id = Bridge.register(url, headers);
-                    Bridge.Probe p = Bridge.probe(id);
+                    Bridge.Probe p;
+                    try {
+                        p = Bridge.probe(id);
+                    } catch (java.net.SocketTimeoutException slow) {
+                        throw new IOException("La web del vídeo no responde (tiempo de espera agotado). "
+                                + "Recarga la página, dale al play otra vez y vuelve a enviarlo.");
+                    }
                     if (p.code >= 400) {
                         throw new IOException("La web no entrega este vídeo (HTTP " + p.code + "). "
                                 + "Recarga la página, dale al play otra vez y vuelve a enviarlo.");

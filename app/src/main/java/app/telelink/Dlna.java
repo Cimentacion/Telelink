@@ -197,6 +197,11 @@ final class Dlna {
 
     private static String soap(Context ctx, String control, String service, String action, String args)
             throws IOException {
+        return soap(ctx, control, service, action, args, 8000);
+    }
+
+    private static String soap(Context ctx, String control, String service, String action, String args,
+                               int readMs) throws IOException {
         String body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
                 + "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
                 + "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>"
@@ -205,6 +210,7 @@ final class Dlna {
         byte[] data = body.getBytes(StandardCharsets.UTF_8);
 
         HttpURLConnection c = open(ctx, control);
+        c.setReadTimeout(readMs);
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
@@ -246,15 +252,76 @@ final class Dlna {
                 + "</item></DIDL-Lite>";
 
         String head = "<InstanceID>0</InstanceID><CurrentURI>" + escape(url) + "</CurrentURI>";
-        try {
-            soap(ctx, d.avControl, AVT, "SetAVTransportURI",
-                    head + "<CurrentURIMetaData>" + escape(didl) + "</CurrentURIMetaData>");
-        } catch (IOException first) {
-            // Algunas teles rechazan los metadatos: segundo intento sin ellos.
-            soap(ctx, d.avControl, AVT, "SetAVTransportURI",
-                    head + "<CurrentURIMetaData></CurrentURIMetaData>");
+        // Hay teles (LG webOS) que no contestan a esta orden hasta haber abierto el vídeo, y eso
+        // puede tardar. Si se les repite la orden mientras tanto responden "701: Transition not
+        // available", así que: se espera mucho más, y ante un 701 se aguarda en vez de insistir.
+        boolean meta = true, set = false;
+        IOException last = null;
+        for (int attempt = 0; attempt < 5 && !set; attempt++) {
+            try {
+                soap(ctx, d.avControl, AVT, "SetAVTransportURI", head + "<CurrentURIMetaData>"
+                        + (meta ? escape(didl) : "") + "</CurrentURIMetaData>", 30000);
+                set = true;
+            } catch (SocketTimeoutException slow) {
+                last = new IOException("La tele no ha contestado a tiempo. Comprueba que está encendida "
+                        + "y en la misma wifi que el móvil, y vuelve a enviarlo.");
+                set = settled(ctx, d, 20000);
+                if (!set) break;
+            } catch (IOException e) {
+                last = e;
+                String m = String.valueOf(e.getMessage());
+                if (m.contains("UPnP 701") || m.contains("UPnP 705")) {
+                    // Ocupada con la orden anterior: se le da tiempo a terminar.
+                    last = new IOException("La tele está ocupada con el envío anterior. "
+                            + "Espera unos segundos y vuelve a enviarlo.\n\n" + m);
+                    settled(ctx, d, 8000);
+                    try {
+                        soap(ctx, d.avControl, AVT, "Stop", "<InstanceID>0</InstanceID>");
+                    } catch (IOException ignored) {
+                    }
+                    pause(1500);
+                } else if (meta) {
+                    meta = false; // algunas teles rechazan los metadatos: se prueba sin ellos
+                } else {
+                    break;
+                }
+            }
         }
-        soap(ctx, d.avControl, AVT, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
+        if (!set) throw last;
+
+        for (int attempt = 0; ; attempt++) {
+            try {
+                soap(ctx, d.avControl, AVT, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>", 30000);
+                return;
+            } catch (SocketTimeoutException slow) {
+                return; // la orden ha llegado; si de verdad no arranca, lo detecta la vigilancia posterior
+            } catch (IOException e) {
+                if (attempt >= 3 || !String.valueOf(e.getMessage()).contains("UPnP 701")) throw e;
+                pause(2000);
+            }
+        }
+    }
+
+    private static void pause(int ms) throws IOException {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            throw new IOException("Envío cancelado");
+        }
+    }
+
+    /** Espera a que la tele deje de estar "en transición". false si no contesta o no termina. */
+    private static boolean settled(Context ctx, Device d, int maxMs) throws IOException {
+        long end = System.currentTimeMillis() + maxMs;
+        while (System.currentTimeMillis() < end) {
+            pause(1500);
+            try {
+                String st = state(ctx, d);
+                if (!st.isEmpty() && !st.equals("TRANSITIONING")) return true;
+            } catch (IOException ignored) {
+            }
+        }
+        return false;
     }
 
     /** Estado de la tele: PLAYING, PAUSED_PLAYBACK, TRANSITIONING, STOPPED, NO_MEDIA_PRESENT... */
