@@ -49,6 +49,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.webkit.WebSettingsCompat;
+import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
 import java.io.ByteArrayInputStream;
@@ -644,6 +645,13 @@ public class MainActivity extends Activity {
         } catch (Throwable ignored) {
         }
 
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(web, COMPAT_JS, Collections.singleton("*"));
+            }
+        } catch (Throwable ignored) {
+        }
+
         web.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int p) {
@@ -740,6 +748,7 @@ public class MainActivity extends Activity {
                     captchaZoomed = "";
                     adsAllowed = getSharedPreferences("noblock", MODE_PRIVATE)
                             .getBoolean(baseDomain(Uri.parse(url).getHost()), false);
+                    view.evaluateJavascript(COMPAT_JS, null);
                 }
             }
 
@@ -747,6 +756,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 if (url != null && url.startsWith("http")) {
                     addHistory(view.getTitle(), url);
+                    view.evaluateJavascript(COMPAT_JS, null); // por si el móvil no admite inyectar al inicio
                     ui.postDelayed(() -> snap(), 2500);
                     final String at = url;
                     ui.postDelayed(() -> zoomCaptcha(at), 1200);
@@ -770,6 +780,18 @@ public class MainActivity extends Activity {
             + "var w=window.visualViewport?window.visualViewport.width:window.innerWidth;"
             + "return 0.75*w/r.width;}catch(x){return 0;}})()";
     private String captchaZoomed = "";
+    /**
+     * El navegador incrustado de Android no trae la API de notificaciones web que sí tiene Chrome.
+     * Hay webs que la consultan al pasar el captcha y, al no encontrarla, dan el formulario por malo.
+     * Se rellena el hueco con lo mismo que responde un Chrome recién instalado ("sin decidir").
+     */
+    private static final String COMPAT_JS = "(function(){try{if(!('Notification' in window)){"
+            + "var N=function(){};N.permission='default';"
+            + "N.requestPermission=function(c){if(c)c('default');return Promise.resolve('default');};"
+            + "window.Notification=N;}"
+            + "if(!navigator.permissions){Object.defineProperty(navigator,'permissions',{value:{"
+            + "query:function(){return Promise.resolve({state:'prompt',onchange:null});}.bind(null)}});}"
+            + "}catch(e){}})();";
     private volatile boolean adsAllowed; // el usuario ha quitado el bloqueo de anuncios en esta web
 
     /**
