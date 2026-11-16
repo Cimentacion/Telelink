@@ -2,6 +2,7 @@ package app.telelink;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
 import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -12,6 +13,7 @@ import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -102,6 +104,8 @@ public class MainActivity extends Activity {
     private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
     private static final String RELEASE = "https://github.com/Cimentacion/Telelink/releases/download/latest/";
     private static final String INSTALL = "app.telelink.INSTALL";
+    /** Guardar en el móvil es solo para clips cortos en archivo directo, no para vídeos largos. */
+    private static final long MAX_SAVE = 60L * 1024 * 1024;
     private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
@@ -421,6 +425,10 @@ public class MainActivity extends Activity {
                 String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.US);
                 if (!scheme.equals("http") && !scheme.equals("https")) return true; // intent://, market://...
                 if (AdBlock.isAd(u.getHost())) return true;
+                if (request.isForMainFrame() && isClip(u)) {
+                    offerSave(u.toString());
+                    return true;
+                }
                 String lock = lockedDomain;
                 if (lock != null && request.isForMainFrame() && !lock.equals(baseDomain(u.getHost()))) {
                     toast("Bloqueado salto a " + u.getHost());
@@ -935,6 +943,112 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    // ---------- Guardar clips cortos ----------
+
+    private static boolean isClip(Uri u) {
+        String p = u.getPath();
+        if (p == null) return false;
+        p = p.toLowerCase(Locale.US);
+        return p.endsWith(".mp4") || p.endsWith(".webm") || p.endsWith(".gif");
+    }
+
+    private void offerSave(final String url) {
+        new AlertDialog.Builder(this)
+                .setTitle("Enlace a un clip")
+                .setItems(new String[]{"Guardar en el móvil", "Abrir aquí"}, (d, which) -> {
+                    if (which == 0) saveClip(url);
+                    else web.loadUrl(url);
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    /** Guarda en Descargas/TeleLink un archivo de vídeo directo, si no pasa del tamaño máximo. */
+    private void saveClip(final String url) {
+        if (Build.VERSION.SDK_INT < 29
+                && checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.WRITE_EXTERNAL_STORAGE"}, 3);
+            toast("Acepta el permiso y vuelve a pulsar Guardar");
+            return;
+        }
+        final String page = currentPage;
+        final String title = pageTitle;
+        toast("Comprobando el clip…");
+        new Thread(() -> {
+            try {
+                String cookie = null;
+                try {
+                    cookie = CookieManager.getInstance().getCookie(url);
+                } catch (Exception ignored) {
+                }
+                HttpURLConnection c = get(url);
+                c.setRequestProperty("Range", "bytes=0-0");
+                if (!userAgent.isEmpty()) c.setRequestProperty("User-Agent", userAgent);
+                if (page.startsWith("http")) c.setRequestProperty("Referer", page);
+                if (cookie != null && !cookie.isEmpty()) c.setRequestProperty("Cookie", cookie);
+                int code = c.getResponseCode();
+                String type = c.getContentType();
+                long size = -1;
+                String range = c.getHeaderField("Content-Range");
+                if (range != null && range.contains("/")) {
+                    try {
+                        size = Long.parseLong(range.substring(range.lastIndexOf('/') + 1).trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                } else if (code == 200) {
+                    size = c.getContentLengthLong();
+                }
+                c.disconnect();
+
+                if (code >= 400) throw new IOException("La web no entrega el archivo (HTTP " + code + ").");
+                if (type != null && type.toLowerCase(Locale.US).contains("mpegurl")) {
+                    throw new IOException("Esto es un streaming, no un archivo. Solo se guardan clips en archivo directo.");
+                }
+                if (size <= 0) throw new IOException("No se puede comprobar el tamaño del archivo.");
+                if (size > MAX_SAVE) {
+                    throw new IOException("Ocupa " + (size / (1024 * 1024)) + " MB. Guardar es solo para clips cortos (máximo "
+                            + (MAX_SAVE / (1024 * 1024)) + " MB).");
+                }
+
+                String last = Uri.parse(url).getLastPathSegment();
+                if (last == null || last.isEmpty()) last = "clip.mp4";
+                String prefix = title == null ? "" : title.replaceAll("[^\\p{L}\\p{N} _-]", "").trim();
+                if (prefix.length() > 40) prefix = prefix.substring(0, 40).trim();
+                final String name = (prefix.isEmpty() ? "" : prefix + " - ") + last.replaceAll("[\\\\/:*?\"<>|]", "_");
+
+                DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+                if (!userAgent.isEmpty()) r.addRequestHeader("User-Agent", userAgent);
+                if (page.startsWith("http")) r.addRequestHeader("Referer", page);
+                if (cookie != null && !cookie.isEmpty()) r.addRequestHeader("Cookie", cookie);
+                r.setTitle(name);
+                r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TeleLink/" + name);
+                ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
+                final long mb = Math.max(1, size / (1024 * 1024));
+                ui.post(() -> toast("Guardando en Descargas/TeleLink (" + mb + " MB)"));
+            } catch (final Exception e) {
+                ui.post(() -> new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("No se ha guardado")
+                        .setMessage(String.valueOf(e.getMessage()))
+                        .setPositiveButton("Vale", null)
+                        .show());
+            }
+        }, "telelink-save").start();
+    }
+
+    /** Botón del menú: guarda el clip directo que esté sonando en la página. */
+    private void saveCurrentClip() {
+        String pick = null;
+        for (String v : videos) {
+            if (isClip(Uri.parse(v))) pick = v;
+        }
+        if (pick == null) {
+            toast("No hay ningún clip en archivo directo en esta página");
+            return;
+        }
+        saveClip(pick);
+    }
+
     // ---------- Menú, favoritos e historial ----------
 
     private JSONArray loadList(String key) {
@@ -986,7 +1100,8 @@ public class MainActivity extends Activity {
                 "Recargar",
                 fav ? "★ Quitar de favoritos" : "☆ Añadir a favoritos",
                 "Favoritos",
-                "Historial"
+                "Historial",
+                "Guardar clip de esta página"
         };
         new AlertDialog.Builder(this)
                 .setItems(items, (d, which) -> {
@@ -1007,8 +1122,10 @@ public class MainActivity extends Activity {
                         }
                     } else if (which == 2) {
                         showList("favorites", "Favoritos", false);
-                    } else {
+                    } else if (which == 3) {
                         showList("history", "Historial", false);
+                    } else {
+                        saveCurrentClip();
                     }
                 })
                 .show();
