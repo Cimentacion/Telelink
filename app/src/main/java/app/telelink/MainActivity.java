@@ -60,7 +60,9 @@ public class MainActivity extends Activity {
             + "h2{color:#3ddc97}b{color:#fff}</style></head><body><h2>TeleLink</h2>"
             + "<p>1. Escribe arriba la web o comparte un enlace desde otra app.</p>"
             + "<p>2. Dale al play del vídeo en la página.</p>"
-            + "<p>3. Pulsa <b>Vídeos</b> y elige cuál mandar a la tele.</p>"
+            + "<p>3. Pulsa el botón verde <b>Enviar a la tele</b>. Si la tele no arranca, "
+            + "la app prueba sola el modo compatible y lo recuerda para esa web.</p>"
+            + "<p><b>Vídeos</b> sirve para elegir a mano otro vídeo u otro modo.</p>"
             + "<p>El candado se pone solo al cargar la página y bloquea los saltos a otras webs. "
             + "Si un anuncio se come el toque, vuelve a pulsar el play. "
             + "Quítalo si necesitas pasar a otra web.</p>"
@@ -71,6 +73,8 @@ public class MainActivity extends Activity {
     private ProgressBar progress;
     private Button btnVideos;
     private Button btnLock;
+    private Button btnSend;
+    private volatile int sendSeq; // cada envío nuevo (o un "Parar") cancela la vigilancia del anterior
 
     private final List<String> videos = new ArrayList<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
@@ -256,6 +260,15 @@ public class MainActivity extends Activity {
         web = new WebView(this);
         root.addView(web, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
+        btnSend = new Button(this);
+        btnSend.setAllCaps(false);
+        btnSend.setTextSize(17);
+        btnSend.setTextColor(Color.parseColor("#0d1117"));
+        btnSend.setBackgroundColor(Color.parseColor("#3ddc97"));
+        btnSend.setVisibility(View.GONE);
+        btnSend.setOnClickListener(v -> quickSend());
+        root.addView(btnSend, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
+
         // Barra inferior
         LinearLayout bottom = new LinearLayout(this);
         bottom.setOrientation(LinearLayout.HORIZONTAL);
@@ -294,6 +307,44 @@ public class MainActivity extends Activity {
     private void refreshVideos() {
         btnVideos.setText("Vídeos (" + videos.size() + ")");
         btnVideos.setTextColor(videos.isEmpty() ? Color.LTGRAY : Color.parseColor("#3ddc97"));
+        btnSend.setVisibility(videos.isEmpty() ? View.GONE : View.VISIBLE);
+        if (videos.isEmpty() || !sending) sendLabel();
+    }
+
+    private volatile boolean sending;
+
+    private void sendLabel() {
+        btnSend.setText(tv == null ? "▶  Enviar a la tele" : "▶  Enviar a " + tv.name);
+    }
+
+    /** Texto de progreso en el botón grande (se puede llamar desde cualquier hilo). */
+    private void status(final String text) {
+        ui.post(() -> btnSend.setText(text));
+    }
+
+    /** El mejor candidato: la lista HLS principal si la hay; si no, el último archivo de vídeo. */
+    private String bestVideo() {
+        String firstHls = null, lastFile = null;
+        for (String v : videos) {
+            String p = Uri.parse(v).getPath();
+            p = p == null ? "" : p.toLowerCase(Locale.US);
+            if (p.endsWith(".m3u8")) {
+                if (p.contains("master")) return v;
+                if (firstHls == null) firstHls = v;
+            } else {
+                lastFile = v;
+            }
+        }
+        return firstHls != null ? firstHls : lastFile;
+    }
+
+    private void quickSend() {
+        String url = bestVideo();
+        if (url == null) {
+            toast("Dale primero al play en la página");
+            return;
+        }
+        send(url, AUTO);
     }
 
     // ---------- Navegador ----------
@@ -584,6 +635,7 @@ public class MainActivity extends Activity {
                         .setItems(names, (d, which) -> {
                             tv = found.get(which);
                             saveTv();
+                            if (!sending) sendLabel();
                             if (then != null) then.run();
                         })
                         .setNegativeButton("Cancelar", null)
@@ -641,6 +693,54 @@ public class MainActivity extends Activity {
         }
     }
 
+    private String siteKey() {
+        try {
+            String host = Uri.parse(currentPage).getHost();
+            return host == null ? "" : "mode_" + baseDomain(host);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * Vigila la tele unos segundos tras enviar. true = está reproduciendo; false = se ha quedado
+     * parada o en negro. Si la tele no informa de su estado, se da por bueno.
+     */
+    private boolean watch(Dlna.Device target, int my) {
+        int playing = 0, dead = 0, unknown = 0;
+        for (int i = 0; i < 10; i++) {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                return true;
+            }
+            if (my != sendSeq) return true;
+            String st;
+            int pos = 0;
+            try {
+                st = Dlna.state(this, target);
+                try {
+                    pos = Dlna.position(this, target);
+                } catch (IOException ignored) {
+                }
+            } catch (IOException e) {
+                unknown++;
+                continue;
+            }
+            if (st.equals("PLAYING") || st.equals("PAUSED_PLAYBACK")) {
+                playing++;
+                dead = 0;
+                if (pos > 0 || playing >= 3) return true;
+            } else if (st.equals("STOPPED") || st.equals("NO_MEDIA_PRESENT")) {
+                playing = 0;
+                if (i >= 1 && ++dead >= 2) return false;
+            } else {
+                playing = 0;
+            }
+        }
+        return unknown >= 8;
+    }
+
     private void send(final String url, final int mode) {
         if (tv == null) {
             pickTv(() -> send(url, mode));
@@ -649,9 +749,14 @@ public class MainActivity extends Activity {
         final Dlna.Device target = tv;
         final String title = pageTitle;
         final Map<String, String> headers = headersFor(url);
+        final String site = siteKey();
+        final SharedPreferences modes = getSharedPreferences("modes", MODE_PRIVATE);
+        final int my = ++sendSeq;
         if (mode != DIRECT) startBridgeService();
-        toast("Enviando a " + target.name + "…");
-        io.execute(() -> {
+        sending = true;
+        status("Enviando a " + target.name + "…");
+
+        new Thread(() -> {
             try {
                 String how;
                 if (mode == DIRECT) {
@@ -665,40 +770,71 @@ public class MainActivity extends Activity {
                     Bridge.Probe p = Bridge.probe(id);
                     if (p.code >= 400) {
                         throw new IOException("La web no entrega este vídeo (HTTP " + p.code + "). "
-                                + "Recarga la página, dale al play otra vez y elige el vídeo nuevo de la lista.");
+                                + "Recarga la página, dale al play otra vez y vuelve a enviarlo.");
                     }
                     String base = "http://" + ip + ":" + port;
-                    String ts = base + "/ts/" + id + "/stream.ts";
                     if (!p.hls) {
                         String mime = p.type != null && p.type.startsWith("video/") ? p.type : "video/mp4";
                         Dlna.play(MainActivity.this, target, base + "/p/" + id + "/video.mp4", title, mime);
                         how = "puente";
-                    } else if (mode == COMPAT) {
-                        Dlna.play(MainActivity.this, target, ts, title, "video/mpeg");
-                        how = "compatible";
                     } else {
-                        try {
-                            Dlna.play(MainActivity.this, target, base + "/p/" + id + "/index.m3u8", title,
-                                    "application/vnd.apple.mpegurl");
+                        // Si con esta web ya hizo falta el modo compatible, se va directo a él.
+                        boolean compatFirst = mode == COMPAT
+                                || (mode == AUTO && modes.getInt(site, AUTO) == COMPAT);
+                        boolean ok = false;
+                        if (!compatFirst) {
+                            try {
+                                Dlna.play(MainActivity.this, target, base + "/p/" + id + "/index.m3u8", title,
+                                        "application/vnd.apple.mpegurl");
+                                status("Comprobando que la tele reproduce…");
+                                ok = watch(target, my);
+                            } catch (IOException rejected) {
+                                ok = false;
+                            }
+                            if (my != sendSeq) return;
+                        }
+                        if (ok) {
                             how = "puente";
-                        } catch (IOException rejected) {
-                            Dlna.play(MainActivity.this, target, ts, title, "video/mpeg");
+                            if (!site.isEmpty()) modes.edit().putInt(site, AUTO).apply();
+                        } else {
+                            if (!compatFirst) status("No arranca. Probando modo compatible…");
+                            Dlna.play(MainActivity.this, target, base + "/ts/" + id + "/stream.ts", title,
+                                    "video/mpeg");
+                            if (compatFirst) status("Comprobando que la tele reproduce…");
+                            ok = watch(target, my);
+                            if (my != sendSeq) return;
+                            if (!ok) {
+                                String err = Bridge.lastError;
+                                throw new IOException("La tele no ha llegado a reproducir el vídeo."
+                                        + (err == null || err.isEmpty() ? "" : "\n\n" + err));
+                            }
                             how = "compatible";
+                            if (!site.isEmpty()) modes.edit().putInt(site, COMPAT).apply();
                         }
                     }
                 }
                 final String h = how;
-                ui.post(() -> toast("Enviado a " + target.name + " (" + h + ")"));
+                ui.post(() -> {
+                    if (my != sendSeq) return;
+                    sending = false;
+                    sendLabel();
+                    toast("Reproduciendo en " + target.name + " (" + h + ")");
+                });
             } catch (final Exception e) {
-                ui.post(() -> new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("No se ha podido enviar")
-                        .setMessage(String.valueOf(e.getMessage()))
-                        .setPositiveButton("Modo compatible", (d, w) -> send(url, COMPAT))
-                        .setNeutralButton("Buscar tele", (d, w) -> pickTv(() -> send(url, mode)))
-                        .setNegativeButton("Cerrar", null)
-                        .show());
+                ui.post(() -> {
+                    if (my != sendSeq) return;
+                    sending = false;
+                    sendLabel();
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("No se ha podido enviar")
+                            .setMessage(String.valueOf(e.getMessage()))
+                            .setPositiveButton("Modo compatible", (d, w) -> send(url, COMPAT))
+                            .setNeutralButton("Buscar tele", (d, w) -> pickTv(() -> send(url, mode)))
+                            .setNegativeButton("Cerrar", null)
+                            .show();
+                });
             }
-        });
+        }, "telelink-send").start();
     }
 
     private interface TvAction {
@@ -740,7 +876,12 @@ public class MainActivity extends Activity {
         addRemote(r2, "+5 min", d -> { Dlna.seekBy(this, d, 300); return null; });
 
         addRemote(r3, "Parar", d -> {
-            ui.post(this::stopBridgeService);
+            sendSeq++;
+            ui.post(() -> {
+                sending = false;
+                sendLabel();
+                stopBridgeService();
+            });
             Dlna.stop(this, d);
             return "Parado";
         });

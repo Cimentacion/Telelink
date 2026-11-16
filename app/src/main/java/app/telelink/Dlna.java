@@ -257,6 +257,19 @@ final class Dlna {
         soap(ctx, d.avControl, AVT, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
     }
 
+    /** Estado de la tele: PLAYING, PAUSED_PLAYBACK, TRANSITIONING, STOPPED, NO_MEDIA_PRESENT... */
+    static String state(Context ctx, Device d) throws IOException {
+        String r = soap(ctx, d.avControl, AVT, "GetTransportInfo", "<InstanceID>0</InstanceID>");
+        String st = tag(r, "CurrentTransportState");
+        return st == null ? "" : st.trim();
+    }
+
+    /** Segundo por el que va la reproducción. */
+    static int position(Context ctx, Device d) throws IOException {
+        String r = soap(ctx, d.avControl, AVT, "GetPositionInfo", "<InstanceID>0</InstanceID>");
+        return parseTime(tag(r, "RelTime"));
+    }
+
     static void resume(Context ctx, Device d) throws IOException {
         soap(ctx, d.avControl, AVT, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
     }
