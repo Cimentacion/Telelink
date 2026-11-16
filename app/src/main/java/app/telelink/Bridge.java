@@ -5,9 +5,11 @@ import android.webkit.CookieManager;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -36,12 +38,14 @@ import javax.crypto.spec.SecretKeySpec;
  *
  *   /p/<id>/...   proxy: archivos (con Range) y listas HLS reescritas para que todo pase por aquí
  *   /ts/<id>/...  modo compatible: une los trozos HLS en un único flujo MPEG-TS continuo
+ *   /c/<id>/...   precarga: el vídeo se va guardando en el móvil y la tele lo lee de ahí
  */
 final class Bridge {
 
     static final class Item {
         String url;
         Map<String, String> headers;
+        boolean low; // en listas con varias calidades, coger una baja en vez de la mejor
     }
 
     /** Lo que pesa o dura un vídeo detectado, para distinguir el bueno de los anuncios. */
@@ -150,6 +154,7 @@ final class Bridge {
         server = null;
         ITEMS.clear();
         KEYS.clear();
+        cancelPreloads();
     }
 
     static String register(String url, Map<String, String> headers) {
@@ -163,10 +168,35 @@ final class Bridge {
         return id;
     }
 
+    /** Como register, pero el modo compatible elegirá una calidad baja si el vídeo trae varias. */
+    static String registerLow(String url, Map<String, String> headers) {
+        String id = register(url, headers);
+        Item it = ITEMS.get(id);
+        if (it != null) it.low = true;
+        return id;
+    }
+
+    /** Cuántas calidades ofrece un vídeo en streaming (1 si solo hay una). */
+    static int variants(String id) {
+        Item it = ITEMS.get(id);
+        if (it == null) return 1;
+        try {
+            String text = fetchText(it, it.url, null);
+            int n = 0;
+            for (String l : text.split("\n")) {
+                if (l.trim().startsWith("#EXT-X-STREAM-INF")) n++;
+            }
+            return Math.max(1, n);
+        } catch (IOException e) {
+            return 1;
+        }
+    }
+
     private static String child(Item parent, String url) {
         Item it = new Item();
         it.url = url;
         it.headers = parent.headers;
+        it.low = parent.low;
         String id = Integer.toString(NEXT.getAndIncrement(), 36);
         ITEMS.put(id, it);
         return id;
@@ -309,6 +339,9 @@ final class Bridge {
                     }
                     serveTs(it, out, headOnly, from);
                 }
+                else if (parts[1].equals("c") && CACHES.get(parts[2]) != null) {
+                    serveCached(it, CACHES.get(parts[2]), base, rh.get("range"), out, headOnly);
+                }
                 else serveProxy(it, base, rh.get("range"), out, headOnly);
             } catch (IOException e) {
                 // Si la tele corta la conexión (cambia de posición, para...) no es un error real.
@@ -425,6 +458,207 @@ final class Bridge {
         return sb.toString();
     }
 
+    // ---------- Precarga: el móvil guarda el vídeo y la tele lo lee del móvil ----------
+
+    static final class Cache {
+        File file;
+        volatile long total = -1, have;
+        volatile boolean done, failed, cancelled;
+        volatile String error = "";
+        volatile String type = "video/mp4";
+    }
+
+    private static final Map<String, Cache> CACHES = new ConcurrentHashMap<>();
+
+    static void cancelPreloads() {
+        for (Cache c : CACHES.values()) {
+            c.cancelled = true;
+            try {
+                c.file.delete();
+            } catch (Exception ignored) {
+            }
+        }
+        CACHES.clear();
+    }
+
+    /** Borra restos de precargas de otra sesión (solo si ahora mismo no hay ninguna en marcha). */
+    static void wipe(File dir) {
+        if (!CACHES.isEmpty()) return;
+        File[] old = dir.listFiles();
+        if (old == null) return;
+        for (File f : old) f.delete();
+    }
+
+    /**
+     * Empieza a bajar al móvil un vídeo en archivo directo. Devuelve el estado de la descarga,
+     * que sigue en segundo plano; la tele puede ir leyendo lo ya bajado por /c/<id>/video.mp4.
+     */
+    static Cache preload(String id, File dir) throws IOException {
+        final Item it = ITEMS.get(id);
+        if (it == null) throw new IOException("vídeo no registrado");
+        cancelPreloads();
+        dir.mkdirs();
+        wipe(dir);
+
+        final HttpURLConnection first = open(it, it.url, "bytes=0-");
+        int code = first.getResponseCode();
+        if (code >= 400) {
+            first.disconnect();
+            throw new IOException("La web no entrega este vídeo (HTTP " + code + ").");
+        }
+        long total = -1;
+        String cr = first.getHeaderField("Content-Range");
+        if (cr != null && cr.contains("/")) {
+            try {
+                total = Long.parseLong(cr.substring(cr.lastIndexOf('/') + 1).trim());
+            } catch (NumberFormatException ignored) {
+            }
+        } else {
+            total = first.getContentLengthLong();
+        }
+        if (total <= 0) {
+            first.disconnect();
+            throw new IOException("La web no dice cuánto ocupa el vídeo, así que no se puede precargar.");
+        }
+        long free = dir.getUsableSpace();
+        if (total + 300L * 1024 * 1024 > free) {
+            first.disconnect();
+            throw new IOException("No hay sitio en el móvil para precargarlo: ocupa " + (total >> 20)
+                    + " MB y quedan " + (free >> 20) + " MB libres.");
+        }
+        final Cache c = new Cache();
+        c.file = new File(dir, id + ".bin");
+        c.total = total;
+        String type = first.getContentType();
+        if (type != null && type.startsWith("video/")) c.type = type;
+        CACHES.put(id, c);
+        Thread t = new Thread(() -> download(it, c, first), "telelink-preload");
+        t.setDaemon(true);
+        t.start();
+        return c;
+    }
+
+    private static void download(Item it, Cache c, HttpURLConnection first) {
+        HttpURLConnection con = first;
+        int fails = 0;
+        try (RandomAccessFile raf = new RandomAccessFile(c.file, "rw")) {
+            byte[] buf = new byte[65536];
+            while (!c.cancelled && c.have < c.total) {
+                long before = c.have;
+                try {
+                    if (con == null) {
+                        con = open(it, it.url, "bytes=" + c.have + "-");
+                        int code = con.getResponseCode();
+                        if (code != 206) {
+                            throw new IOException(code >= 400 ? "la web respondió HTTP " + code
+                                    : "la web no deja continuar la descarga donde se quedó");
+                        }
+                    }
+                    InputStream in = con.getInputStream();
+                    int r;
+                    while (!c.cancelled && c.have < c.total && (r = in.read(buf)) > 0) {
+                        int n = (int) Math.min(r, c.total - c.have);
+                        raf.seek(c.have);
+                        raf.write(buf, 0, n);
+                        c.have += n;
+                    }
+                } catch (IOException e) {
+                    c.error = String.valueOf(e.getMessage());
+                } finally {
+                    if (con != null) con.disconnect();
+                    con = null;
+                }
+                if (c.have > before) {
+                    fails = 0;
+                } else if (++fails >= 6) {
+                    if (c.error.isEmpty()) c.error = "la web ha dejado de enviar el vídeo";
+                    c.failed = true;
+                    lastError = "Precarga cortada: " + c.error;
+                    return;
+                } else {
+                    try {
+                        Thread.sleep(1500);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+            c.done = c.have >= c.total;
+        } catch (Exception e) {
+            c.error = String.valueOf(e.getMessage());
+            c.failed = true;
+        }
+    }
+
+    private static void serveCached(Item it, Cache c, String base, String range, OutputStream out,
+                                    boolean headOnly) throws IOException {
+        long a = 0, b = c.total - 1;
+        boolean partial = false;
+        if (range != null && range.startsWith("bytes=")) {
+            try {
+                String spec = range.substring(6).split(",")[0].trim();
+                int dash = spec.indexOf('-');
+                String from = spec.substring(0, dash).trim(), to = spec.substring(dash + 1).trim();
+                if (from.isEmpty()) {
+                    a = Math.max(0, c.total - Long.parseLong(to));
+                } else {
+                    a = Long.parseLong(from);
+                    if (!to.isEmpty()) b = Math.min(b, Long.parseLong(to));
+                }
+                partial = true;
+            } catch (Exception e) {
+                a = 0;
+                b = c.total - 1;
+            }
+        }
+        if (a < 0 || a >= c.total || b < a) {
+            simple(out, 416, "Range Not Satisfiable");
+            return;
+        }
+        // Si la tele pide un punto al que la descarga aún no ha llegado (un salto, o el índice que
+        // algunos mp4 llevan al final), ese trozo se pide directamente a la web.
+        if (!c.done && a > c.have + 4L * 1024 * 1024) {
+            serveProxy(it, base, range, out, headOnly);
+            return;
+        }
+        String h = "HTTP/1.1 " + (partial ? "206 Partial Content" : "200 OK") + "\r\n"
+                + "Content-Type: " + c.type + "\r\n"
+                + "Content-Length: " + (b - a + 1) + "\r\n"
+                + (partial ? "Content-Range: bytes " + a + "-" + b + "/" + c.total + "\r\n" : "")
+                + "Accept-Ranges: bytes\r\n"
+                + "transferMode.dlna.org: Streaming\r\n"
+                + "Connection: close\r\n\r\n";
+        out.write(h.getBytes(StandardCharsets.US_ASCII));
+        if (headOnly) return;
+        try (RandomAccessFile raf = new RandomAccessFile(c.file, "r")) {
+            byte[] buf = new byte[65536];
+            long pos = a;
+            int stalled = 0;
+            while (pos <= b) {
+                long avail = c.have - pos;
+                if (avail <= 0) {
+                    if (c.failed || c.cancelled) throw new IOException("Precarga cortada: " + c.error);
+                    if (stalled > 120000) throw new IOException("La web va demasiado lenta para la precarga");
+                    out.flush();
+                    try {
+                        Thread.sleep(200);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    stalled += 200;
+                    continue;
+                }
+                stalled = 0;
+                int n = (int) Math.min(buf.length, Math.min(avail, b - pos + 1));
+                raf.seek(pos);
+                int r = raf.read(buf, 0, n);
+                if (r <= 0) continue;
+                out.write(buf, 0, r);
+                pos += r;
+            }
+        }
+    }
+
     // ---------- Modo compatible: HLS -> un único MPEG-TS ----------
 
     private static final class Seg {
@@ -440,15 +674,18 @@ final class Bridge {
         return m.group(2) != null ? m.group(2) : m.group(1);
     }
 
-    /** Descarga la lista HLS y, si es una lista de calidades, baja a la de mayor calidad. {texto, url final}. */
+    /**
+     * Descarga la lista HLS y, si es una lista de calidades, baja a la de mayor calidad; con
+     * it.low, a la mejor que no pase de 1,6 Mbps (o la más baja que haya). {texto, url final}.
+     */
     private static String[] mediaPlaylist(Item it) throws IOException {
         String[] fin = new String[1];
         String text = fetchText(it, it.url, fin);
         String self = fin[0];
 
         if (text.contains("#EXT-X-STREAM-INF")) {
-            long best = -1;
-            String bestUrl = null;
+            long best = -1, lowBw = -1, minBw = Long.MAX_VALUE;
+            String bestUrl = null, lowUrl = null, minUrl = null;
             String[] ls = text.split("\n");
             for (int i = 0; i < ls.length; i++) {
                 String l = ls[i].trim();
@@ -465,9 +702,18 @@ final class Bridge {
                         best = bw;
                         bestUrl = resolve(self, n);
                     }
+                    if (bw <= 1600000 && bw > lowBw) {
+                        lowBw = bw;
+                        lowUrl = resolve(self, n);
+                    }
+                    if (bw < minBw) {
+                        minBw = bw;
+                        minUrl = resolve(self, n);
+                    }
                     break;
                 }
             }
+            if (it.low && (lowUrl != null || minUrl != null)) bestUrl = lowUrl != null ? lowUrl : minUrl;
             if (bestUrl == null) throw new IOException("lista HLS sin calidades");
             text = fetchText(it, bestUrl, fin);
             self = fin[0];

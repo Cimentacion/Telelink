@@ -114,7 +114,7 @@ public class MainActivity extends Activity {
     private final ExecutorService probes = Executors.newFixedThreadPool(3);
     private volatile String currentPage = "";
     private String userAgent = "";
-    private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
+    private static final int AUTO = 0, COMPAT = 1, DIRECT = 2, PRELOAD = 3, LOW = 4;
     private static final String RELEASE = "https://github.com/Cimentacion/Telelink/releases/download/latest/";
     private static final String INSTALL = "app.telelink.INSTALL";
     /** Tamaño máximo de un archivo directo que se puede guardar en el móvil (5000 MB). */
@@ -130,6 +130,7 @@ public class MainActivity extends Activity {
         buildUi();
         setupWeb();
         loadSavedTv();
+        Bridge.wipe(new File(getCacheDir(), "preload"));
         if (!handleIntent(getIntent())) {
             showHome();
         }
@@ -1080,7 +1081,9 @@ public class MainActivity extends Activity {
         String[] modes = {
                 "Automático (recomendado)",
                 "Modo compatible\nSi la tele da error o se queda en negro",
-                "Directo\nSin pasar por el móvil"
+                "Directo\nSin pasar por el móvil",
+                "Precargar en el móvil\nPara webs lentas o teles que tardan en abrir. Solo archivos directos (mp4)",
+                "Compatible con menos calidad\nPara wifi floja. Solo si el vídeo trae varias calidades"
         };
         new AlertDialog.Builder(this)
                 .setTitle("Cómo enviarlo")
@@ -1228,7 +1231,8 @@ public class MainActivity extends Activity {
                     String ip = Dlna.wifiIp(MainActivity.this);
                     if (ip == null) throw new IOException("El móvil no está en la wifi.");
                     int port = Bridge.start();
-                    String id = Bridge.register(url, headers);
+                    Bridge.cancelPreloads(); // una precarga anterior ya no hace falta
+                    String id = mode == LOW ? Bridge.registerLow(url, headers) : Bridge.register(url, headers);
                     Bridge.Probe p;
                     try {
                         p = Bridge.probe(id);
@@ -1243,13 +1247,41 @@ public class MainActivity extends Activity {
                     String base = "http://" + ip + ":" + port;
                     ses.id = id;
                     ses.base = base;
-                    if (!p.hls) {
+                    if (mode == PRELOAD) {
+                        if (p.hls) {
+                            throw new IOException("Este vídeo es un streaming por trozos y no se puede precargar. "
+                                    + "Usa Automático o Modo compatible.");
+                        }
+                        Bridge.Cache cache = Bridge.preload(id, new File(getCacheDir(), "preload"));
+                        // Colchón antes de avisar a la tele: el 5 % del vídeo, entre 24 y 80 MB.
+                        long mega = 1024L * 1024;
+                        long need = Math.min(cache.total, Math.min(80 * mega, Math.max(24 * mega, cache.total / 20)));
+                        while (cache.have < need) {
+                            if (my != sendSeq) {
+                                Bridge.cancelPreloads();
+                                return;
+                            }
+                            if (cache.failed) throw new IOException("La precarga se ha cortado: " + cache.error);
+                            status("Precargando… " + (cache.have / mega) + " de " + (need / mega) + " MB");
+                            Thread.sleep(700);
+                        }
+                        status("Enviando a " + target.name + "…");
+                        Dlna.play(MainActivity.this, target, base + "/c/" + id + "/video.mp4", title, cache.type);
+                        ses.how = "precarga";
+                    } else if (!p.hls) {
+                        if (mode == LOW) {
+                            throw new IOException("Este vídeo es un archivo con una sola calidad y no se puede "
+                                    + "bajar. Prueba «Precargar en el móvil».");
+                        }
                         String mime = p.type != null && p.type.startsWith("video/") ? p.type : "video/mp4";
                         Dlna.play(MainActivity.this, target, base + "/p/" + id + "/video.mp4", title, mime);
                         ses.how = "puente";
                     } else {
                         // Si con esta web ya hizo falta el modo compatible, se va directo a él.
-                        boolean compatFirst = mode == COMPAT
+                        if (mode == LOW && Bridge.variants(id) <= 1) {
+                            ui.post(() -> toast("Este vídeo solo trae una calidad: se envía tal cual"));
+                        }
+                        boolean compatFirst = mode == COMPAT || mode == LOW
                                 || (mode == AUTO && modes.getInt(site, AUTO) == COMPAT);
                         boolean ok = false;
                         if (!compatFirst) {
@@ -1309,7 +1341,7 @@ public class MainActivity extends Activity {
                     new AlertDialog.Builder(MainActivity.this)
                             .setTitle("No se ha podido enviar")
                             .setMessage(String.valueOf(e.getMessage()))
-                            .setPositiveButton("Modo compatible", (d, w) -> send(url, COMPAT, startAt))
+                            .setPositiveButton("Probar otro modo", (d, w) -> chooseMode(url))
                             .setNeutralButton("Buscar tele", (d, w) -> pickTv(() -> send(url, mode, startAt)))
                             .setNegativeButton("Cerrar", null)
                             .show();
@@ -1729,7 +1761,8 @@ public class MainActivity extends Activity {
                 "Favoritos",
                 "Historial",
                 "Guardar clip de esta página",
-                adsAllowed ? "Volver a bloquear anuncios en esta web" : "Quitar bloqueo de anuncios en esta web"
+                adsAllowed ? "Volver a bloquear anuncios en esta web" : "Quitar bloqueo de anuncios en esta web",
+                "Duplicar pantalla en la tele (opcional)"
         };
         new AlertDialog.Builder(this)
                 .setItems(items, (d, which) -> {
@@ -1760,6 +1793,8 @@ public class MainActivity extends Activity {
                         showList("history", "Historial", false);
                     } else if (which == 5) {
                         saveCurrentClip();
+                    } else if (which == 7) {
+                        mirror();
                     } else if (!page) {
                         toast("Abre primero una web");
                     } else {
@@ -1772,6 +1807,24 @@ public class MainActivity extends Activity {
                     }
                 })
                 .show();
+    }
+
+    /**
+     * Alternativa cuando el envío normal no va: abre el ajuste de Android para duplicar la pantalla
+     * del móvil en la tele (Miracast / Smart View). No pasa por la wifi del router.
+     */
+    private void mirror() {
+        String[] actions = {"android.settings.CAST_SETTINGS", "android.settings.WIRELESS_SETTINGS",
+                "android.settings.SETTINGS"};
+        for (String a : actions) {
+            try {
+                startActivity(new Intent(a));
+                toast("Elige tu tele en la lista. El móvil tiene que quedarse con la pantalla encendida.");
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        toast("Este móvil no tiene ajuste para duplicar pantalla");
     }
 
     /** Lista de páginas guardadas. En modo borrar, tocar una la quita en vez de abrirla. */
