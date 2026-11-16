@@ -54,6 +54,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -90,6 +91,9 @@ public class MainActivity extends Activity {
     private volatile String lockedDomain; // null = candado quitado
     private volatile String pageTitle = "Vídeo";
     private final Map<String, Map<String, String>> videoHeaders = new ConcurrentHashMap<>();
+    private final Map<String, Bridge.Info> infos = new ConcurrentHashMap<>();
+    private final Set<String> measuring = ConcurrentHashMap.newKeySet();
+    private final ExecutorService probes = Executors.newFixedThreadPool(3);
     private volatile String currentPage = "";
     private String userAgent = "";
     private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
@@ -432,8 +436,71 @@ public class MainActivity extends Activity {
         ui.post(() -> btnSend.setText(text));
     }
 
-    /** El mejor candidato: la lista HLS principal si la hay; si no, el último archivo de vídeo. */
+    // ---------- Medir los vídeos detectados ----------
+
+    private void measure(final String url) {
+        if (infos.containsKey(url) || !measuring.add(url)) return;
+        final Map<String, String> h = headersFor(url);
+        probes.execute(() -> {
+            try {
+                infos.put(url, Bridge.measure(url, h));
+            } finally {
+                measuring.remove(url);
+            }
+        });
+    }
+
+    /** Ejecuta "then" cuando todos los vídeos de la lista están medidos (o tras unos segundos). */
+    private void withInfos(final Runnable then) {
+        final List<String> snap = new ArrayList<>(videos);
+        boolean ready = true;
+        for (String v : snap) {
+            if (!infos.containsKey(v)) {
+                ready = false;
+                measure(v);
+            }
+        }
+        if (ready) {
+            then.run();
+            return;
+        }
+        new Thread(() -> {
+            long end = System.currentTimeMillis() + 7000;
+            while (System.currentTimeMillis() < end) {
+                boolean all = true;
+                for (String v : snap) if (!infos.containsKey(v)) all = false;
+                if (all) break;
+                try {
+                    Thread.sleep(150);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+            ui.post(then);
+        }, "telelink-measure").start();
+    }
+
+    /** Peso comparable: segundos de duración; los archivos se convierten a segundos aproximados. */
+    private long score(String url) {
+        Bridge.Info i = infos.get(url);
+        if (i == null || i.code >= 400) return 0;
+        if (i.hls) return Math.max(0, i.secs);
+        return i.bytes > 0 ? i.bytes / 200000 : 0;
+    }
+
+    /** Los vídeos ordenados del más largo/pesado al más pequeño. */
+    private List<String> ranked() {
+        List<String> list = new ArrayList<>(videos);
+        java.util.Collections.sort(list, (x, y) -> Long.compare(score(y), score(x)));
+        return list;
+    }
+
+    /** El vídeo de verdad suele ser el más largo o pesado; los anuncios falsos son cortos. */
     private String bestVideo() {
+        List<String> list = ranked();
+        if (list.isEmpty()) return null;
+        if (score(list.get(0)) > 0) return list.get(0);
+        // Sin medidas: la lista HLS principal si la hay; si no, el último archivo.
         String firstHls = null, lastFile = null;
         for (String v : videos) {
             String p = Uri.parse(v).getPath();
@@ -449,12 +516,21 @@ public class MainActivity extends Activity {
     }
 
     private void quickSend() {
-        String url = bestVideo();
-        if (url == null) {
+        if (videos.isEmpty()) {
             toast("Dale primero al play en la página");
             return;
         }
-        send(url, AUTO);
+        if (sending) return;
+        btnSend.setText("Eligiendo el vídeo…");
+        withInfos(() -> {
+            String url = bestVideo();
+            if (url == null) {
+                sendLabel();
+                toast("Dale primero al play en la página");
+                return;
+            }
+            send(url, AUTO);
+        });
     }
 
     // ---------- Navegador ----------
@@ -664,17 +740,31 @@ public class MainActivity extends Activity {
             if (!videos.contains(url)) {
                 videos.add(url);
                 refreshVideos();
+                measure(url);
             }
         });
     }
 
-    private static String label(String url) {
+    private static String size(long bytes) {
+        if (bytes >= 1024L * 1024 * 1024) {
+            return String.format(Locale.US, "%.1f GB", bytes / (1024.0 * 1024 * 1024)).replace('.', ',');
+        }
+        return Math.max(1, bytes / (1024 * 1024)) + " MB";
+    }
+
+    private String label(String url, boolean top) {
         Uri u = Uri.parse(url);
         String name = u.getLastPathSegment();
         if (name == null) name = url;
-        if (name.length() > 40) name = "…" + name.substring(name.length() - 40);
+        if (name.length() > 34) name = "…" + name.substring(name.length() - 34);
+        Bridge.Info i = infos.get(url);
+        String what;
+        if (i == null) what = "sin medir";
+        else if (i.code >= 400) what = "no disponible";
+        else if (i.hls) what = i.secs > 0 ? "dura " + clock(i.secs) : "duración desconocida";
+        else what = i.bytes > 0 ? size(i.bytes) : "tamaño desconocido";
         String type = name.toLowerCase(Locale.US).endsWith(".m3u8") ? "HLS" : "Archivo";
-        return type + " · " + name + "\n" + u.getHost();
+        return (top ? "★ " : "") + type + " · " + what + "\n" + name + " · " + u.getHost();
     }
 
     private void showVideos() {
@@ -687,18 +777,25 @@ public class MainActivity extends Activity {
                     .show();
             return;
         }
-        final List<String> snapshot = new ArrayList<>(videos);
-        String[] items = new String[snapshot.size()];
-        for (int i = 0; i < items.length; i++) items[i] = label(snapshot.get(i));
-        new AlertDialog.Builder(this)
-                .setTitle("Mandar a la tele")
-                .setItems(items, (d, which) -> chooseMode(snapshot.get(which)))
-                .setNeutralButton("Vaciar lista", (d, w) -> {
-                    videos.clear();
-                    refreshVideos();
-                })
-                .setNegativeButton("Cancelar", null)
-                .show();
+        btnVideos.setText("Midiendo…");
+        withInfos(() -> {
+            refreshVideos();
+            final List<String> snapshot = ranked();
+            if (snapshot.isEmpty()) return;
+            boolean known = score(snapshot.get(0)) > 0;
+            String[] items = new String[snapshot.size()];
+            for (int i = 0; i < items.length; i++) items[i] = label(snapshot.get(i), known && i == 0);
+            new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("Mandar a la tele (el ★ es el más largo)")
+                    .setItems(items, (d, which) -> chooseMode(snapshot.get(which)))
+                    .setNeutralButton("Vaciar lista", (d, w) -> {
+                        videos.clear();
+                        infos.clear();
+                        refreshVideos();
+                    })
+                    .setNegativeButton("Cancelar", null)
+                    .show();
+        });
     }
 
     // ---------- Tele ----------

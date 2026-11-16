@@ -44,6 +44,65 @@ final class Bridge {
         Map<String, String> headers;
     }
 
+    /** Lo que pesa o dura un vídeo detectado, para distinguir el bueno de los anuncios. */
+    static final class Info {
+        boolean hls;
+        long bytes = -1;
+        int secs = -1;
+        int code;
+    }
+
+    static Info measure(String url, Map<String, String> headers) {
+        Item it = new Item();
+        it.url = url;
+        it.headers = headers;
+        Info info = new Info();
+        String path = "";
+        try {
+            String p = new URL(url).getPath();
+            if (p != null) path = p.toLowerCase(Locale.US);
+        } catch (Exception ignored) {
+        }
+        info.hls = path.endsWith(".m3u8");
+        try {
+            if (info.hls) {
+                String text = mediaPlaylist(it)[0];
+                double total = 0;
+                for (String raw : text.split("\n")) {
+                    String l = raw.trim();
+                    if (!l.startsWith("#EXTINF:")) continue;
+                    String v = l.substring(8);
+                    int comma = v.indexOf(',');
+                    try {
+                        total += Double.parseDouble((comma >= 0 ? v.substring(0, comma) : v).trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                info.secs = (int) total;
+                info.code = 200;
+            } else {
+                HttpURLConnection c = open(it, url, "bytes=0-0");
+                try {
+                    info.code = c.getResponseCode();
+                    String range = c.getHeaderField("Content-Range");
+                    if (range != null && range.contains("/")) {
+                        try {
+                            info.bytes = Long.parseLong(range.substring(range.lastIndexOf('/') + 1).trim());
+                        } catch (NumberFormatException ignored) {
+                        }
+                    } else if (info.code == 200) {
+                        info.bytes = c.getContentLengthLong();
+                    }
+                } finally {
+                    c.disconnect();
+                }
+            }
+        } catch (Exception e) {
+            if (info.code == 0) info.code = 599;
+        }
+        return info;
+    }
+
     static final class Probe {
         int code;
         boolean hls;
@@ -381,7 +440,8 @@ final class Bridge {
         return m.group(2) != null ? m.group(2) : m.group(1);
     }
 
-    private static List<Seg> segments(Item it) throws IOException {
+    /** Descarga la lista HLS y, si es una lista de calidades, baja a la de mayor calidad. {texto, url final}. */
+    private static String[] mediaPlaylist(Item it) throws IOException {
         String[] fin = new String[1];
         String text = fetchText(it, it.url, fin);
         String self = fin[0];
@@ -412,6 +472,13 @@ final class Bridge {
             text = fetchText(it, bestUrl, fin);
             self = fin[0];
         }
+        return new String[]{text, self};
+    }
+
+    private static List<Seg> segments(Item it) throws IOException {
+        String[] mp = mediaPlaylist(it);
+        String text = mp[0];
+        String self = mp[1];
 
         List<Seg> list = new ArrayList<>();
         long seq = 0;
