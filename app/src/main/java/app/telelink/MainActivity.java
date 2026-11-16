@@ -9,7 +9,11 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -18,6 +22,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -60,20 +65,6 @@ import org.json.JSONObject;
 
 public class MainActivity extends Activity {
 
-    private static final String HOME = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-            + "<style>body{background:#12151c;color:#dfe3ea;font-family:sans-serif;padding:24px;line-height:1.5}"
-            + "h2{color:#3ddc97}b{color:#fff}</style></head><body><h2>TeleLink</h2>"
-            + "<p>1. Escribe arriba la web o comparte un enlace desde otra app.</p>"
-            + "<p>2. Dale al play del vídeo en la página.</p>"
-            + "<p>3. Pulsa el botón verde <b>Enviar a la tele</b>. Si la tele no arranca, "
-            + "la app prueba sola el modo compatible y lo recuerda para esa web.</p>"
-            + "<p><b>Vídeos</b> sirve para elegir a mano otro vídeo u otro modo.</p>"
-            + "<p><b>☰</b> tiene favoritos e historial. La app recuerda por dónde ibas en cada vídeo.</p>"
-            + "<p>El candado se pone solo al cargar la página y bloquea los saltos a otras webs. "
-            + "Si un anuncio se come el toque, vuelve a pulsar el play. "
-            + "Quítalo si necesitas pasar a otra web.</p>"
-            + "<p>Móvil y tele tienen que estar en la misma wifi.</p></body></html>";
-
     private WebView web;
     private EditText urlBar;
     private ProgressBar progress;
@@ -105,7 +96,7 @@ public class MainActivity extends Activity {
     private static final String RELEASE = "https://github.com/Cimentacion/Telelink/releases/download/latest/";
     private static final String INSTALL = "app.telelink.INSTALL";
     /** Guardar en el móvil es solo para clips cortos en archivo directo, no para vídeos largos. */
-    private static final long MAX_SAVE = 60L * 1024 * 1024;
+    private static final long MAX_SAVE = 100L * 1024 * 1024;
     private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
@@ -115,7 +106,7 @@ public class MainActivity extends Activity {
         setupWeb();
         loadSavedTv();
         if (!handleIntent(getIntent())) {
-            web.loadDataWithBaseURL(null, HOME, "text/html", "utf-8", null);
+            showHome();
         }
         checkUpdate();
     }
@@ -222,8 +213,28 @@ public class MainActivity extends Activity {
 
     // ---------- Interfaz ----------
 
+    // Paleta
+    private static final int BG = 0xFF0F1218, SURFACE = 0xFF171C26, RAISED = 0xFF242B39,
+            ACCENT = 0xFF3DDC97, ACCENT_DIM = 0xFF1D3A30, TEXT = 0xFFE6E9EF, MUTED = 0xFF8B93A3,
+            ON_ACCENT = 0xFF0B1410;
+
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    /** Fondo redondeado con efecto al pulsar. */
+    private Drawable pill(int color, int radiusDp) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(radiusDp));
+        return new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), g, null);
+    }
+
+    private LinearLayout.LayoutParams cell(int width, int height, float weight, int marginDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(width, height, weight);
+        int m = dp(marginDp);
+        lp.setMargins(m, m, m, m);
+        return lp;
     }
 
     private Button bar(String text) {
@@ -231,26 +242,43 @@ public class MainActivity extends Activity {
         b.setText(text);
         b.setAllCaps(false);
         b.setTextSize(14);
-        b.setPadding(dp(4), 0, dp(4), 0);
+        b.setTextColor(TEXT);
+        b.setSingleLine(true);
+        b.setEllipsize(TextUtils.TruncateAt.END);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setPadding(dp(6), 0, dp(6), 0);
+        b.setStateListAnimator(null);
+        b.setBackground(pill(RAISED, 12));
         return b;
     }
 
     private void buildUi() {
+        getWindow().setStatusBarColor(SURFACE);
+        getWindow().setNavigationBarColor(SURFACE);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#12151c"));
+        root.setBackgroundColor(BG);
 
         // Barra de dirección
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(dp(6), dp(2), dp(6), dp(2));
+        top.setBackgroundColor(SURFACE);
+        top.setPadding(dp(8), dp(6), dp(8), dp(6));
 
         urlBar = new EditText(this);
         urlBar.setSingleLine(true);
-        urlBar.setHint("Web o búsqueda");
+        urlBar.setHint("Busca o escribe una web");
+        urlBar.setHintTextColor(MUTED);
+        urlBar.setTextColor(TEXT);
         urlBar.setTextSize(15);
         urlBar.setSelectAllOnFocus(true);
+        urlBar.setBackground(pill(RAISED, 22));
+        urlBar.setPadding(dp(16), 0, dp(16), 0);
         urlBar.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         urlBar.setImeOptions(EditorInfo.IME_ACTION_GO);
         urlBar.setOnEditorActionListener((v, actionId, event) -> {
@@ -262,59 +290,124 @@ public class MainActivity extends Activity {
             }
             return false;
         });
-        top.addView(urlBar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        top.addView(urlBar, new LinearLayout.LayoutParams(0, dp(44), 1));
 
         Button goBtn = bar("Ir");
+        goBtn.setTextColor(ON_ACCENT);
+        goBtn.setBackground(pill(ACCENT, 22));
         goBtn.setOnClickListener(v -> go(urlBar.getText().toString()));
-        top.addView(goBtn, new LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams goLp = new LinearLayout.LayoutParams(dp(56), dp(44));
+        goLp.setMargins(dp(8), 0, 0, 0);
+        top.addView(goBtn, goLp);
         root.addView(top);
 
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(100);
+        progress.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        progress.setProgressBackgroundTintList(ColorStateList.valueOf(SURFACE));
         progress.setVisibility(View.INVISIBLE);
         root.addView(progress, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)));
 
         web = new WebView(this);
+        web.setBackgroundColor(BG);
         root.addView(web, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
+        // Botón grande de enviar: solo aparece cuando hay un vídeo detectado
+        LinearLayout sendWrap = new LinearLayout(this);
+        sendWrap.setBackgroundColor(SURFACE);
         btnSend = new Button(this);
         btnSend.setAllCaps(false);
-        btnSend.setTextSize(17);
-        btnSend.setTextColor(Color.parseColor("#0d1117"));
-        btnSend.setBackgroundColor(Color.parseColor("#3ddc97"));
+        btnSend.setTextSize(16);
+        btnSend.setTextColor(ON_ACCENT);
+        btnSend.setSingleLine(true);
+        btnSend.setEllipsize(TextUtils.TruncateAt.END);
+        btnSend.setStateListAnimator(null);
+        btnSend.setBackground(pill(ACCENT, 14));
         btnSend.setVisibility(View.GONE);
         btnSend.setOnClickListener(v -> quickSend());
-        root.addView(btnSend, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
+        LinearLayout.LayoutParams sendLp =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        sendLp.setMargins(dp(8), dp(8), dp(8), dp(2));
+        sendWrap.addView(btnSend, sendLp);
+        root.addView(sendWrap);
 
         // Barra inferior
         LinearLayout bottom = new LinearLayout(this);
         bottom.setOrientation(LinearLayout.HORIZONTAL);
-        bottom.setPadding(dp(4), 0, dp(4), 0);
+        bottom.setBackgroundColor(SURFACE);
+        bottom.setPadding(dp(5), dp(3), dp(5), dp(5));
 
         Button back = bar("◀");
         back.setOnClickListener(v -> {
             if (web.canGoBack()) web.goBack();
         });
-        bottom.addView(back, new LinearLayout.LayoutParams(0, dp(50), 1));
+        bottom.addView(back, cell(0, dp(46), 1, 3));
 
         Button menu = bar("☰");
+        menu.setTextSize(17);
         menu.setOnClickListener(v -> showMenu());
-        bottom.addView(menu, new LinearLayout.LayoutParams(0, dp(50), 1));
+        bottom.addView(menu, cell(0, dp(46), 1, 3));
 
         btnLock = bar("🔓");
         btnLock.setOnClickListener(v -> toggleLock());
-        bottom.addView(btnLock, new LinearLayout.LayoutParams(0, dp(50), 1));
+        bottom.addView(btnLock, cell(0, dp(46), 1, 3));
 
-        btnVideos = bar("Vídeos (0)");
+        btnVideos = bar("Vídeos · 0");
         btnVideos.setOnClickListener(v -> showVideos());
-        bottom.addView(btnVideos, new LinearLayout.LayoutParams(0, dp(50), 2.4f));
+        bottom.addView(btnVideos, cell(0, dp(46), 2.2f, 3));
 
         Button remote = bar("Mando");
         remote.setOnClickListener(v -> showRemote());
-        bottom.addView(remote, new LinearLayout.LayoutParams(0, dp(50), 1.8f));
+        bottom.addView(remote, cell(0, dp(46), 1.8f, 3));
 
         root.addView(bottom);
         setContentView(root);
+    }
+
+    // ---------- Portada ----------
+
+    private static String esc(String t) {
+        return t == null ? "" : t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;");
+    }
+
+    private void cards(StringBuilder h, String heading, JSONArray a, int max) {
+        if (a.length() == 0) return;
+        SharedPreferences resume = getSharedPreferences("resume", MODE_PRIVATE);
+        h.append("<h3>").append(heading).append("</h3>");
+        for (int i = 0; i < a.length() && i < max; i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o == null) continue;
+            String u = o.optString("u");
+            String host = Uri.parse(u).getHost();
+            int pos = resume.getInt(u, 0);
+            h.append("<a class='c' href=\"").append(esc(u)).append("\"><b>").append(esc(o.optString("t")))
+                    .append("</b><span>").append(esc(host == null ? u : host))
+                    .append(pos >= 60 ? " · vas por " + clock(pos) : "").append("</span></a>");
+        }
+    }
+
+    /** Portada con los pasos básicos, tus favoritos y lo último que abriste. */
+    private void showHome() {
+        StringBuilder h = new StringBuilder();
+        h.append("<html><head><meta name='viewport' content='width=device-width,initial-scale=1'><style>")
+                .append("body{background:#0f1218;color:#e6e9ef;font-family:sans-serif;margin:0;padding:22px 18px 40px}")
+                .append("h1{color:#3ddc97;font-size:26px;margin:6px 0 2px}p.s{color:#8b93a3;margin:0 0 18px}")
+                .append("ol{padding-left:20px;line-height:1.55;color:#c9ced8;margin:0 0 8px}")
+                .append("h3{color:#8b93a3;font-size:13px;text-transform:uppercase;letter-spacing:.08em;margin:26px 0 8px}")
+                .append("a.c{display:block;background:#171c26;border-radius:12px;padding:12px 14px;margin:0 0 8px;")
+                .append("text-decoration:none;color:#e6e9ef}a.c b{display:block;font-weight:600;white-space:nowrap;")
+                .append("overflow:hidden;text-overflow:ellipsis}a.c span{color:#8b93a3;font-size:13px}")
+                .append("</style></head><body><h1>TeleLink</h1><p class='s'>Del móvil a la tele, sin anuncios.</p>")
+                .append("<ol><li>Abre una web y dale al play.</li>")
+                .append("<li>Pulsa el botón verde <b>Enviar a la tele</b>.</li>")
+                .append("<li>Controla la peli desde <b>Mando</b>.</li></ol>");
+        cards(h, "Favoritos", loadList("favorites"), 12);
+        cards(h, "Recientes", loadList("history"), 6);
+        h.append("</body></html>");
+        currentPage = "";
+        urlBar.setText("");
+        web.loadDataWithBaseURL(null, h.toString(), "text/html", "utf-8", null);
     }
 
     private void toast(String s) {
@@ -322,8 +415,8 @@ public class MainActivity extends Activity {
     }
 
     private void refreshVideos() {
-        btnVideos.setText("Vídeos (" + videos.size() + ")");
-        btnVideos.setTextColor(videos.isEmpty() ? Color.LTGRAY : Color.parseColor("#3ddc97"));
+        btnVideos.setText("Vídeos · " + videos.size());
+        btnVideos.setTextColor(videos.isEmpty() ? MUTED : ACCENT);
         btnSend.setVisibility(videos.isEmpty() ? View.GONE : View.VISIBLE);
         if (videos.isEmpty() || !sending) sendLabel();
     }
@@ -425,6 +518,10 @@ public class MainActivity extends Activity {
                 String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.US);
                 if (!scheme.equals("http") && !scheme.equals("https")) return true; // intent://, market://...
                 if (AdBlock.isAd(u.getHost())) return true;
+                if (request.isForMainFrame() && currentPage.isEmpty()) {
+                    go(u.toString());
+                    return true;
+                }
                 if (request.isForMainFrame() && isClip(u)) {
                     offerSave(u.toString());
                     return true;
@@ -471,6 +568,7 @@ public class MainActivity extends Activity {
         }
         // Navegación pedida por el usuario: el candado se quita para no bloquearla.
         setLock(null);
+        currentPage = url; // desde ya deja de contar como portada (evita reabrir en cada redirección)
         autoLockPending = true;
         videos.clear();
         videoHeaders.clear();
@@ -531,6 +629,7 @@ public class MainActivity extends Activity {
     private void setLock(String domain) {
         lockedDomain = domain;
         btnLock.setText(domain == null ? "🔓" : "🔒");
+        btnLock.setBackground(pill(domain == null ? RAISED : ACCENT_DIM, 12));
     }
 
     /** Aproximación: las dos últimas partes del host (o tres si es tipo .co.uk / .com.es). */
@@ -1097,6 +1196,7 @@ public class MainActivity extends Activity {
         final boolean page = url != null && url.startsWith("http");
         final boolean fav = page && indexOf(loadList("favorites"), url) >= 0;
         String[] items = {
+                "Inicio",
                 "Recargar",
                 fav ? "★ Quitar de favoritos" : "☆ Añadir a favoritos",
                 "Favoritos",
@@ -1106,8 +1206,14 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setItems(items, (d, which) -> {
                     if (which == 0) {
-                        web.reload();
+                        setLock(null);
+                        videos.clear();
+                        videoHeaders.clear();
+                        refreshVideos();
+                        showHome();
                     } else if (which == 1) {
+                        web.reload();
+                    } else if (which == 2) {
                         if (!page) {
                             toast("Abre primero una web");
                         } else if (fav) {
@@ -1120,9 +1226,9 @@ public class MainActivity extends Activity {
                             putFirst("favorites", web.getTitle(), url, 200);
                             toast("Guardado en favoritos");
                         }
-                    } else if (which == 2) {
-                        showList("favorites", "Favoritos", false);
                     } else if (which == 3) {
+                        showList("favorites", "Favoritos", false);
+                    } else if (which == 4) {
                         showList("history", "Historial", false);
                     } else {
                         saveCurrentClip();
@@ -1224,6 +1330,7 @@ public class MainActivity extends Activity {
         TextView diag = new TextView(this);
         diag.setPadding(dp(4), dp(10), dp(4), 0);
         diag.setTextSize(12);
+        diag.setTextColor(MUTED);
         String err = Bridge.lastError;
         diag.setText("Peticiones de la tele al móvil: " + Bridge.hits.get()
                 + (err == null || err.isEmpty() ? "" : "\nÚltimo error: " + err));
@@ -1244,7 +1351,7 @@ public class MainActivity extends Activity {
     private void addRemote(LinearLayout row, String text, final TvAction action) {
         Button b = bar(text);
         b.setOnClickListener(v -> control(action));
-        row.addView(b, new LinearLayout.LayoutParams(0, dp(56), 1));
+        row.addView(b, cell(0, dp(54), 1, 4));
     }
 
     // ---------- Ciclo de vida ----------
