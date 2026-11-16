@@ -9,6 +9,9 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Rect;
+import android.media.MediaMetadataRetriever;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.Drawable;
@@ -23,8 +26,10 @@ import android.os.Looper;
 import android.os.Message;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.PixelCopy;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
@@ -44,13 +49,19 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -77,7 +88,9 @@ public class MainActivity extends Activity {
     /** Lo último que se mandó a la tele: hace falta para saltar y para recordar por dónde ibas. */
     private static final class Session {
         Dlna.Device target;
-        String id, base, how, title, pageKey;
+        String id, base, how, title, pageKey, src;
+        Map<String, String> headers;
+        volatile boolean framing;
         volatile int offset; // segundo en el que empieza el flujo actual (solo modo compatible)
     }
 
@@ -99,8 +112,11 @@ public class MainActivity extends Activity {
     private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
     private static final String RELEASE = "https://github.com/Cimentacion/Telelink/releases/download/latest/";
     private static final String INSTALL = "app.telelink.INSTALL";
-    /** Tamaño máximo de un archivo directo que se puede guardar en el móvil (1000 MB). */
-    private static final long MAX_SAVE = 1000L * 1024 * 1024;
+    /** Tamaño máximo de un archivo directo que se puede guardar en el móvil (5000 MB). */
+    private static final long MAX_SAVE = 5000L * 1024 * 1024;
+    private boolean resumed;
+    private float[] lastBox; // dónde estaba el vídeo dentro de la página en la última captura
+    private String lastBoxUrl = "";
     private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
@@ -375,24 +391,74 @@ public class MainActivity extends Activity {
                 .replace("\"", "&quot;");
     }
 
-    private void cards(StringBuilder h, String heading, JSONArray a, int max) {
+    /** Nombre corto para las listas: "Naruto 1" en vez del título entero de la web. */
+    private static String nice(String title, String url) {
+        try {
+            Uri u = Uri.parse(url);
+            String site = baseDomain(u.getHost());
+            int dot = site.indexOf('.');
+            String n = Names.nice(title, dot > 0 ? site.substring(0, dot) : site, u.getLastPathSegment());
+            return n == null || n.isEmpty() ? (title == null || title.isEmpty() ? url : title) : n;
+        } catch (Exception e) {
+            return title == null || title.isEmpty() ? url : title;
+        }
+    }
+
+    private void cards(StringBuilder h, String heading, String key, int max, boolean grid) {
+        JSONArray a = loadList(key);
         if (a.length() == 0) return;
         SharedPreferences resume = getSharedPreferences("resume", MODE_PRIVATE);
-        h.append("<h3>").append(heading).append("</h3>");
+        h.append("<h3>").append(heading);
+        if (grid) h.append("<a href='telelink://clear'>Borrar</a>");
+        h.append("</h3>");
+        if (grid) h.append("<div class='grid'>");
         for (int i = 0; i < a.length() && i < max; i++) {
             JSONObject o = a.optJSONObject(i);
             if (o == null) continue;
             String u = o.optString("u");
             String host = Uri.parse(u).getHost();
             int pos = resume.getInt(u, 0);
-            h.append("<a class='c' href=\"").append(esc(u)).append("\"><b>").append(esc(o.optString("t")))
-                    .append("</b><span>").append(esc(host == null ? u : host))
-                    .append(pos >= 60 ? " · vas por " + clock(pos) : "").append("</span></a>");
+            String name = esc(nice(o.optString("t"), u));
+            String sub = esc(host == null ? u : host) + (pos >= 60 ? " · vas por " + clock(pos) : "");
+            if (!grid) {
+                h.append("<a class='c' href=\"").append(esc(u)).append("\"><b>").append(name)
+                        .append("</b><span>").append(sub).append("</span></a>");
+                continue;
+            }
+            String img = thumbData(u, pos >= 60);
+            h.append("<div class='g'><a class='o' href=\"").append(esc(u)).append("\">")
+                    .append(img == null ? "<i></i>" : "<img src='" + img + "'>")
+                    .append("<b>").append(name).append("</b><span>").append(sub).append("</span></a>")
+                    .append("<a class='x' href=\"telelink://remove?u=").append(Uri.encode(u)).append("\">×</a></div>");
+        }
+        if (grid) h.append("</div>");
+    }
+
+    /** Botones de la portada: borrar todos los recientes o quitar uno. */
+    private void homeAction(Uri u) {
+        if ("clear".equals(u.getHost())) {
+            new AlertDialog.Builder(this)
+                    .setTitle("¿Borrar los recientes?")
+                    .setPositiveButton("Borrar", (d, w) -> {
+                        storeList("history", new JSONArray());
+                        showHome();
+                    })
+                    .setNegativeButton("Cancelar", null)
+                    .show();
+        } else if ("remove".equals(u.getHost())) {
+            String target = u.getQueryParameter("u");
+            JSONArray a = loadList("history");
+            int i = target == null ? -1 : indexOf(a, target);
+            if (i < 0) return;
+            a.remove(i);
+            storeList("history", a);
+            showHome();
         }
     }
 
     /** Portada con los pasos básicos, tus favoritos y lo último que abriste. */
     private void showHome() {
+        grabNow();
         StringBuilder h = new StringBuilder();
         h.append("<html><head><meta name='viewport' content='width=device-width,initial-scale=1'><style>")
                 .append("body{background:#0f1218;color:#e6e9ef;font-family:sans-serif;margin:0;padding:22px 18px 40px}")
@@ -402,12 +468,24 @@ public class MainActivity extends Activity {
                 .append("a.c{display:block;background:#171c26;border-radius:12px;padding:12px 14px;margin:0 0 8px;")
                 .append("text-decoration:none;color:#e6e9ef}a.c b{display:block;font-weight:600;white-space:nowrap;")
                 .append("overflow:hidden;text-overflow:ellipsis}a.c span{color:#8b93a3;font-size:13px}")
+                .append("h3 a{float:right;color:#3ddc97;text-decoration:none;text-transform:none;letter-spacing:0;")
+                .append("font-weight:normal;padding:0 2px}")
+                .append(".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}")
+                .append(".g{position:relative;background:#171c26;border-radius:12px;overflow:hidden}")
+                .append(".g a.o{display:block;text-decoration:none;color:#e6e9ef}")
+                .append(".g img,.g i{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#0b0e13}")
+                .append(".g b,.g span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}")
+                .append(".g b{font-weight:600;font-size:14px;padding:8px 10px 0}")
+                .append(".g span{color:#8b93a3;font-size:12px;padding:2px 10px 9px}")
+                .append(".g a.x{position:absolute;top:6px;right:6px;width:28px;height:28px;line-height:28px;")
+                .append("text-align:center;border-radius:14px;background:rgba(0,0,0,.6);color:#fff;")
+                .append("text-decoration:none;font-size:17px}")
                 .append("</style></head><body><h1>TeleLink</h1><p class='s'>Del móvil a la tele, sin anuncios.</p>")
                 .append("<ol><li>Abre una web y dale al play.</li>")
                 .append("<li>Pulsa el botón verde <b>Enviar a la tele</b>.</li>")
                 .append("<li>Controla la peli desde <b>Mando</b>.</li></ol>");
-        cards(h, "Favoritos", loadList("favorites"), 12);
-        cards(h, "Recientes", loadList("history"), 6);
+        cards(h, "Favoritos", "favorites", 12, false);
+        cards(h, "Recientes", "history", 6, true);
         h.append("</body></html>");
         currentPage = "";
         urlBar.setText("");
@@ -592,6 +670,10 @@ public class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri u = request.getUrl();
                 String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.US);
+                if (scheme.equals("telelink")) {
+                    if (currentPage.isEmpty()) homeAction(u); // solo valen desde la portada
+                    return true;
+                }
                 if (!scheme.equals("http") && !scheme.equals("https")) return true; // intent://, market://...
                 if (AdBlock.isAd(u.getHost())) return true;
                 if (request.isForMainFrame() && currentPage.isEmpty()) {
@@ -620,7 +702,10 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                if (url != null && url.startsWith("http")) addHistory(view.getTitle(), url);
+                if (url != null && url.startsWith("http")) {
+                    addHistory(view.getTitle(), url);
+                    ui.postDelayed(() -> snap(), 2500);
+                }
                 if (!autoLockPending || url == null || !url.startsWith("http")) return;
                 autoLockPending = false;
                 String host = Uri.parse(url).getHost();
@@ -642,6 +727,7 @@ public class MainActivity extends Activity {
         } else {
             url = "https://duckduckgo.com/?q=" + Uri.encode(t);
         }
+        grabNow();
         // Navegación pedida por el usuario: el candado se quita para no bloquearla.
         setLock(null);
         currentPage = url; // desde ya deja de contar como portada (evita reabrir en cada redirección)
@@ -1028,6 +1114,8 @@ public class MainActivity extends Activity {
                 ses.target = target;
                 ses.title = title;
                 ses.pageKey = pageKey;
+                ses.src = url;
+                ses.headers = headers;
                 if (mode == DIRECT) {
                     Dlna.play(MainActivity.this, target, url, title, null);
                     ses.how = "directo";
@@ -1123,7 +1211,7 @@ public class MainActivity extends Activity {
     private void track(final Session ses, final int my) {
         new Thread(() -> {
             final SharedPreferences resume = getSharedPreferences("resume", MODE_PRIVATE);
-            int stopped = 0;
+            int stopped = 0, saves = 0;
             while (my == sendSeq && stopped < 4) {
                 try {
                     Thread.sleep(15000);
@@ -1138,6 +1226,7 @@ public class MainActivity extends Activity {
                         int pos = Dlna.position(MainActivity.this, ses.target) + ses.offset;
                         if (pos >= 60 && ses.pageKey != null && ses.pageKey.startsWith("http")) {
                             resume.edit().putInt(ses.pageKey, pos).apply();
+                            if (saves++ % 4 == 0) frameThumb(ses, pos); // un fotograma por minuto
                         }
                     } else if (st.equals("STOPPED") || st.equals("NO_MEDIA_PRESENT")) {
                         stopped++;
@@ -1268,6 +1357,212 @@ public class MainActivity extends Activity {
         saveClip(pick);
     }
 
+    // ---------- Miniaturas: captura de por dónde ibas ----------
+
+    /** Devuelve, en fracciones de la pantalla de la web, el hueco del vídeo o reproductor más grande. */
+    private static final String BOX_JS = "(function(){try{var W=window.innerWidth,H=window.innerHeight,b='',m=0,"
+            + "e=document.querySelectorAll('video,iframe');for(var i=0;i<e.length;i++){"
+            + "var r=e[i].getBoundingClientRect(),x=Math.max(0,r.left),y=Math.max(0,r.top),"
+            + "w=Math.min(W,r.right)-x,h=Math.min(H,r.bottom)-y;if(w<W*0.4||h<H*0.1)continue;"
+            + "if(w*h>m){m=w*h;b=[x/W,y/H,w/W,h/H].join(',');}}return b;}catch(x){return '';}})()";
+
+    private final Runnable snapTick = new Runnable() {
+        @Override
+        public void run() {
+            snap();
+            ui.postDelayed(this, 10000);
+        }
+    };
+
+    private static String thumbKey(String url) {
+        try {
+            byte[] d = MessageDigest.getInstance("MD5").digest(url.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte x : d) sb.append(String.format(Locale.US, "%02x", x));
+            return sb.toString();
+        } catch (Exception e) {
+            return "x";
+        }
+    }
+
+    /** frame = fotograma sacado del propio vídeo; si no, captura de la página. */
+    private File thumbFile(String url, boolean frame) {
+        return new File(new File(getFilesDir(), "thumbs"), thumbKey(url) + (frame ? ".f.jpg" : ".jpg"));
+    }
+
+    /** La miniatura lista para incrustar en la portada, o null si esa página no tiene. */
+    private String thumbData(String url, boolean started) {
+        File f = thumbFile(url, true);
+        if (!started || !f.isFile()) f = thumbFile(url, false);
+        if (!f.isFile() || f.length() > 300000) return null;
+        try (FileInputStream in = new FileInputStream(f)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            return "data:image/jpeg;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void storeThumb(final File f, final Bitmap bmp) {
+        probes.execute(() -> {
+            try {
+                File dir = f.getParentFile();
+                if (dir != null) dir.mkdirs();
+                File tmp = new File(f.getPath() + ".tmp");
+                try (FileOutputStream o = new FileOutputStream(tmp)) {
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 72, o);
+                }
+                if (!tmp.renameTo(f)) tmp.delete();
+            } catch (Exception ignored) {
+            } finally {
+                bmp.recycle();
+            }
+        });
+    }
+
+    /** Borra las miniaturas de páginas que ya no están ni en recientes ni en favoritos. */
+    private void pruneThumbs() {
+        final JSONArray hist = loadList("history"), favs = loadList("favorites");
+        probes.execute(() -> {
+            try {
+                File[] files = new File(getFilesDir(), "thumbs").listFiles();
+                if (files == null || files.length == 0) return;
+                Set<String> keep = new HashSet<>();
+                for (JSONArray a : new JSONArray[]{hist, favs}) {
+                    for (int i = 0; i < a.length(); i++) {
+                        JSONObject o = a.optJSONObject(i);
+                        if (o != null) keep.add(thumbKey(o.optString("u")));
+                    }
+                }
+                for (File f : files) {
+                    String n = f.getName();
+                    int dot = n.indexOf('.');
+                    if (!keep.contains(dot > 0 ? n.substring(0, dot) : n)) f.delete();
+                }
+            } catch (Exception ignored) {
+            }
+        });
+    }
+
+    /** Captura periódica: busca dónde está el vídeo en la página y guarda esa zona. */
+    private void snap() {
+        final String url = currentPage;
+        if (!resumed || !url.startsWith("http") || progress.getVisibility() == View.VISIBLE) return;
+        try {
+            web.evaluateJavascript(BOX_JS, v -> {
+                if (!url.equals(currentPage)) return;
+                float[] box = null;
+                try {
+                    String[] p = v == null ? new String[0] : v.replace("\"", "").split(",");
+                    if (p.length == 4) {
+                        box = new float[4];
+                        for (int i = 0; i < 4; i++) box[i] = Float.parseFloat(p[i]);
+                    }
+                } catch (Exception e) {
+                    box = null;
+                }
+                lastBox = box;
+                lastBoxUrl = url;
+                grab(url, box);
+            });
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Captura inmediata, justo antes de salir de la página. */
+    private void grabNow() {
+        final String url = currentPage;
+        if (!resumed || !url.startsWith("http") || progress.getVisibility() == View.VISIBLE) return;
+        grab(url, url.equals(lastBoxUrl) ? lastBox : null);
+    }
+
+    private void grab(final String url, float[] box) {
+        try {
+            int w = web.getWidth(), h = web.getHeight();
+            if (w <= 0 || h <= 0) return;
+            float x = 0, y = 0, bw = w, bh = h;
+            if (box != null) {
+                x = box[0] * w;
+                y = box[1] * h;
+                bw = box[2] * w;
+                bh = box[3] * h;
+            }
+            // Recorte a 16:9: centrado si es el reproductor, desde arriba si es la página entera.
+            float tall = bw * 9f / 16f;
+            if (bh > tall) {
+                if (box != null) y += (bh - tall) / 2f;
+                bh = tall;
+            } else {
+                float wide = bh * 16f / 9f;
+                x += (bw - wide) / 2f;
+                bw = wide;
+            }
+            if (bw < 32 || bh < 18) return;
+            final Bitmap bmp = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888);
+            final File out = thumbFile(url, false);
+            if (Build.VERSION.SDK_INT >= 26) {
+                int[] at = new int[2];
+                web.getLocationInWindow(at);
+                Rect r = new Rect(at[0] + (int) x, at[1] + (int) y, at[0] + (int) (x + bw), at[1] + (int) (y + bh));
+                PixelCopy.request(getWindow(), r, bmp, res -> {
+                    if (res == PixelCopy.SUCCESS) storeThumb(out, bmp);
+                    else bmp.recycle();
+                }, ui);
+            } else {
+                Canvas c = new Canvas(bmp);
+                float sc = 320f / bw;
+                c.scale(sc, sc);
+                c.translate(-x - web.getScrollX(), -y - web.getScrollY());
+                web.draw(c);
+                storeThumb(out, bmp);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Saca del propio vídeo el fotograma del segundo por el que va la tele. */
+    private void frameThumb(final Session ses, final int pos) {
+        if (ses.src == null || ses.pageKey == null || ses.framing) return;
+        ses.framing = true;
+        final File out = thumbFile(ses.pageKey, true);
+        new Thread(() -> {
+            MediaMetadataRetriever r = new MediaMetadataRetriever();
+            try {
+                Map<String, String> h = new HashMap<>();
+                if (ses.headers != null) {
+                    for (Map.Entry<String, String> e : ses.headers.entrySet()) {
+                        String k = e.getKey();
+                        if (k.equalsIgnoreCase("Referer") || k.equalsIgnoreCase("User-Agent")
+                                || k.equalsIgnoreCase("Cookie") || k.equalsIgnoreCase("Origin")) {
+                            h.put(k, e.getValue());
+                        }
+                    }
+                }
+                r.setDataSource(ses.src, h);
+                Bitmap full = r.getFrameAtTime(pos * 1000000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                if (full == null || full.getWidth() < 16 || full.getHeight() < 9) return;
+                Bitmap bmp = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888);
+                float sc = Math.max(320f / full.getWidth(), 180f / full.getHeight());
+                Canvas c = new Canvas(bmp);
+                c.translate((320 - full.getWidth() * sc) / 2f, (180 - full.getHeight() * sc) / 2f);
+                c.scale(sc, sc);
+                c.drawBitmap(full, 0, 0, new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG));
+                full.recycle();
+                storeThumb(out, bmp);
+            } catch (Throwable ignored) {
+            } finally {
+                try {
+                    r.release();
+                } catch (Throwable ignored) {
+                }
+                ses.framing = false;
+            }
+        }, "telelink-frame").start();
+    }
+
     // ---------- Menú, favoritos e historial ----------
 
     private JSONArray loadList(String key) {
@@ -1280,6 +1575,7 @@ public class MainActivity extends Activity {
 
     private void storeList(String key, JSONArray a) {
         getSharedPreferences("lists", MODE_PRIVATE).edit().putString(key, a.toString()).apply();
+        pruneThumbs();
     }
 
     private int indexOf(JSONArray a, String url) {
@@ -1369,7 +1665,7 @@ public class MainActivity extends Activity {
         for (int i = 0; i < items.length; i++) {
             JSONObject o = a.optJSONObject(i);
             String u = o == null ? "" : o.optString("u");
-            String t = o == null ? "" : o.optString("t");
+            String t = o == null ? "" : nice(o.optString("t"), u);
             int pos = resume.getInt(u, 0);
             String host = Uri.parse(u).getHost();
             items[i] = t + "\n" + (host == null ? u : host) + (pos >= 60 ? "  ·  vas por " + clock(pos) : "");
@@ -1478,6 +1774,7 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        grabNow();
         if (web.canGoBack()) web.goBack();
         else super.onBackPressed();
     }
@@ -1485,6 +1782,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        grabNow();
+        resumed = false;
+        ui.removeCallbacks(snapTick);
         web.onPause();
     }
 
@@ -1492,6 +1792,9 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         web.onResume();
+        resumed = true;
+        ui.removeCallbacks(snapTick);
+        ui.postDelayed(snapTick, 10000);
     }
 
     @Override
