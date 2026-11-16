@@ -282,6 +282,13 @@ final class Dlna {
         soap(ctx, d.avControl, AVT, "Stop", "<InstanceID>0</InstanceID>");
     }
 
+    static void seekTo(Context ctx, Device d, int target) throws IOException {
+        int t = Math.max(0, target);
+        String s = String.format(Locale.US, "%02d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60);
+        soap(ctx, d.avControl, AVT, "Seek",
+                "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>" + s + "</Target>");
+    }
+
     static void seekBy(Context ctx, Device d, int seconds) throws IOException {
         String info = soap(ctx, d.avControl, AVT, "GetPositionInfo", "<InstanceID>0</InstanceID>");
         int now = parseTime(tag(info, "RelTime"));

@@ -241,7 +241,15 @@ final class Bridge {
             String host = rh.get("host");
             String base = "http://" + (host != null ? host : s.getLocalAddress().getHostAddress() + ":" + s.getLocalPort());
             try {
-                if (parts[1].equals("ts")) serveTs(it, out, headOnly);
+                if (parts[1].equals("ts")) {
+                    // /ts/<id>/<segundo de inicio>/stream.ts  (sin número = desde el principio)
+                    int from = 0;
+                    try {
+                        if (parts.length > 4) from = Integer.parseInt(parts[3]);
+                    } catch (NumberFormatException ignored) {
+                    }
+                    serveTs(it, out, headOnly, from);
+                }
                 else serveProxy(it, base, rh.get("range"), out, headOnly);
             } catch (IOException e) {
                 // Si la tele corta la conexión (cambia de posición, para...) no es un error real.
@@ -364,6 +372,7 @@ final class Bridge {
         String url;
         String keyUrl;
         byte[] iv;
+        double dur;
     }
 
     private static String attr(String line, String name) {
@@ -408,9 +417,20 @@ final class Bridge {
         long seq = 0;
         String keyUrl = null;
         byte[] iv = null;
+        double dur = 0;
         for (String raw : text.split("\n")) {
             String l = raw.trim();
             if (l.isEmpty()) continue;
+            if (l.startsWith("#EXTINF:")) {
+                try {
+                    String v = l.substring(8);
+                    int comma = v.indexOf(',');
+                    dur = Double.parseDouble((comma >= 0 ? v.substring(0, comma) : v).trim());
+                } catch (Exception e) {
+                    dur = 0;
+                }
+                continue;
+            }
             if (l.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
                 try {
                     seq = Long.parseLong(l.substring(l.indexOf(':') + 1).trim());
@@ -435,6 +455,8 @@ final class Bridge {
                 s.url = resolve(self, l);
                 s.keyUrl = keyUrl;
                 if (keyUrl != null) s.iv = iv != null ? iv : seqIv(seq);
+                s.dur = dur;
+                dur = 0;
                 list.add(s);
                 seq++;
             }
@@ -458,7 +480,7 @@ final class Bridge {
         return iv;
     }
 
-    private static void serveTs(Item it, OutputStream out, boolean headOnly) throws IOException {
+    private static void serveTs(Item it, OutputStream out, boolean headOnly, int from) throws IOException {
         List<Seg> segs;
         try {
             segs = segments(it);
@@ -476,7 +498,14 @@ final class Bridge {
         out.flush();
         if (headOnly) return;
 
+        double acc = 0;
         for (Seg s : segs) {
+            // Salta los trozos anteriores al punto de inicio pedido.
+            if (acc + s.dur <= from) {
+                acc += s.dur;
+                continue;
+            }
+            acc += s.dur;
             HttpURLConnection c = open(it, s.url, null);
             try {
                 int code = c.getResponseCode();

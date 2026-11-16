@@ -53,6 +53,9 @@ import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 public class MainActivity extends Activity {
 
     private static final String HOME = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -63,6 +66,7 @@ public class MainActivity extends Activity {
             + "<p>3. Pulsa el botón verde <b>Enviar a la tele</b>. Si la tele no arranca, "
             + "la app prueba sola el modo compatible y lo recuerda para esa web.</p>"
             + "<p><b>Vídeos</b> sirve para elegir a mano otro vídeo u otro modo.</p>"
+            + "<p><b>☰</b> tiene favoritos e historial. La app recuerda por dónde ibas en cada vídeo.</p>"
             + "<p>El candado se pone solo al cargar la página y bloquea los saltos a otras webs. "
             + "Si un anuncio se come el toque, vuelve a pulsar el play. "
             + "Quítalo si necesitas pasar a otra web.</p>"
@@ -74,7 +78,16 @@ public class MainActivity extends Activity {
     private Button btnVideos;
     private Button btnLock;
     private Button btnSend;
-    private volatile int sendSeq; // cada envío nuevo (o un "Parar") cancela la vigilancia del anterior
+    private volatile int sendSeq;
+
+    /** Lo último que se mandó a la tele: hace falta para saltar y para recordar por dónde ibas. */
+    private static final class Session {
+        Dlna.Device target;
+        String id, base, how, title, pageKey;
+        volatile int offset; // segundo en el que empieza el flujo actual (solo modo compatible)
+    }
+
+    private volatile Session session; // cada envío nuevo (o un "Parar") cancela la vigilancia del anterior
 
     private final List<String> videos = new ArrayList<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
@@ -280,9 +293,9 @@ public class MainActivity extends Activity {
         });
         bottom.addView(back, new LinearLayout.LayoutParams(0, dp(50), 1));
 
-        Button reload = bar("⟳");
-        reload.setOnClickListener(v -> web.reload());
-        bottom.addView(reload, new LinearLayout.LayoutParams(0, dp(50), 1));
+        Button menu = bar("☰");
+        menu.setOnClickListener(v -> showMenu());
+        bottom.addView(menu, new LinearLayout.LayoutParams(0, dp(50), 1));
 
         btnLock = bar("🔓");
         btnLock.setOnClickListener(v -> toggleLock());
@@ -426,6 +439,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
+                if (url != null && url.startsWith("http")) addHistory(view.getTitle(), url);
                 if (!autoLockPending || url == null || !url.startsWith("http")) return;
                 autoLockPending = false;
                 String host = Uri.parse(url).getHost();
@@ -741,13 +755,38 @@ public class MainActivity extends Activity {
         return unknown >= 8;
     }
 
+    private static String clock(int secs) {
+        int h = secs / 3600, m = (secs / 60) % 60, sec = secs % 60;
+        return h > 0 ? String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
+                : String.format(Locale.US, "%d:%02d", m, sec);
+    }
+
+    /** Envía; si de esta página hay un punto guardado, pregunta si seguir desde ahí. */
     private void send(final String url, final int mode) {
         if (tv == null) {
             pickTv(() -> send(url, mode));
             return;
         }
+        final int saved = getSharedPreferences("resume", MODE_PRIVATE).getInt(currentPage, 0);
+        if (saved < 60) {
+            send(url, mode, 0);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Ya habías empezado este vídeo")
+                .setPositiveButton("Seguir desde " + clock(saved), (d, w) -> send(url, mode, saved))
+                .setNegativeButton("Desde el principio", (d, w) -> send(url, mode, 0))
+                .show();
+    }
+
+    private void send(final String url, final int mode, final int startAt) {
+        if (tv == null) {
+            pickTv(() -> send(url, mode, startAt));
+            return;
+        }
         final Dlna.Device target = tv;
         final String title = pageTitle;
+        final String pageKey = currentPage;
         final Map<String, String> headers = headersFor(url);
         final String site = siteKey();
         final SharedPreferences modes = getSharedPreferences("modes", MODE_PRIVATE);
@@ -758,10 +797,13 @@ public class MainActivity extends Activity {
 
         new Thread(() -> {
             try {
-                String how;
+                final Session ses = new Session();
+                ses.target = target;
+                ses.title = title;
+                ses.pageKey = pageKey;
                 if (mode == DIRECT) {
                     Dlna.play(MainActivity.this, target, url, title, null);
-                    how = "directo";
+                    ses.how = "directo";
                 } else {
                     String ip = Dlna.wifiIp(MainActivity.this);
                     if (ip == null) throw new IOException("El móvil no está en la wifi.");
@@ -773,10 +815,12 @@ public class MainActivity extends Activity {
                                 + "Recarga la página, dale al play otra vez y vuelve a enviarlo.");
                     }
                     String base = "http://" + ip + ":" + port;
+                    ses.id = id;
+                    ses.base = base;
                     if (!p.hls) {
                         String mime = p.type != null && p.type.startsWith("video/") ? p.type : "video/mp4";
                         Dlna.play(MainActivity.this, target, base + "/p/" + id + "/video.mp4", title, mime);
-                        how = "puente";
+                        ses.how = "puente";
                     } else {
                         // Si con esta web ya hizo falta el modo compatible, se va directo a él.
                         boolean compatFirst = mode == COMPAT
@@ -794,12 +838,12 @@ public class MainActivity extends Activity {
                             if (my != sendSeq) return;
                         }
                         if (ok) {
-                            how = "puente";
+                            ses.how = "puente";
                             if (!site.isEmpty()) modes.edit().putInt(site, AUTO).apply();
                         } else {
                             if (!compatFirst) status("No arranca. Probando modo compatible…");
-                            Dlna.play(MainActivity.this, target, base + "/ts/" + id + "/stream.ts", title,
-                                    "video/mpeg");
+                            Dlna.play(MainActivity.this, target,
+                                    base + "/ts/" + id + "/" + startAt + "/stream.ts", title, "video/mpeg");
                             if (compatFirst) status("Comprobando que la tele reproduce…");
                             ok = watch(target, my);
                             if (my != sendSeq) return;
@@ -808,17 +852,28 @@ public class MainActivity extends Activity {
                                 throw new IOException("La tele no ha llegado a reproducir el vídeo."
                                         + (err == null || err.isEmpty() ? "" : "\n\n" + err));
                             }
-                            how = "compatible";
+                            ses.how = "compatible";
+                            ses.offset = startAt;
                             if (!site.isEmpty()) modes.edit().putInt(site, COMPAT).apply();
                         }
                     }
                 }
-                final String h = how;
+                // En los modos en que la tele sabe saltar, se coloca en el punto guardado.
+                if (startAt > 0 && !"compatible".equals(ses.how)) {
+                    try {
+                        Thread.sleep(1500);
+                        Dlna.seekTo(MainActivity.this, target, startAt);
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (my != sendSeq) return;
+                session = ses;
+                track(ses, my);
                 ui.post(() -> {
                     if (my != sendSeq) return;
                     sending = false;
                     sendLabel();
-                    toast("Reproduciendo en " + target.name + " (" + h + ")");
+                    toast("Reproduciendo en " + target.name + " (" + ses.how + ")");
                 });
             } catch (final Exception e) {
                 ui.post(() -> {
@@ -828,13 +883,174 @@ public class MainActivity extends Activity {
                     new AlertDialog.Builder(MainActivity.this)
                             .setTitle("No se ha podido enviar")
                             .setMessage(String.valueOf(e.getMessage()))
-                            .setPositiveButton("Modo compatible", (d, w) -> send(url, COMPAT))
-                            .setNeutralButton("Buscar tele", (d, w) -> pickTv(() -> send(url, mode)))
+                            .setPositiveButton("Modo compatible", (d, w) -> send(url, COMPAT, startAt))
+                            .setNeutralButton("Buscar tele", (d, w) -> pickTv(() -> send(url, mode, startAt)))
                             .setNegativeButton("Cerrar", null)
                             .show();
                 });
             }
         }, "telelink-send").start();
+    }
+
+    /** Mientras se reproduce, guarda cada 15 s por dónde va para poder retomarlo otro día. */
+    private void track(final Session ses, final int my) {
+        new Thread(() -> {
+            final SharedPreferences resume = getSharedPreferences("resume", MODE_PRIVATE);
+            int stopped = 0;
+            while (my == sendSeq && stopped < 4) {
+                try {
+                    Thread.sleep(15000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (my != sendSeq) return;
+                try {
+                    String st = Dlna.state(MainActivity.this, ses.target);
+                    if (st.equals("PLAYING") || st.equals("PAUSED_PLAYBACK")) {
+                        stopped = 0;
+                        int pos = Dlna.position(MainActivity.this, ses.target) + ses.offset;
+                        if (pos >= 60 && ses.pageKey != null && ses.pageKey.startsWith("http")) {
+                            resume.edit().putInt(ses.pageKey, pos).apply();
+                        }
+                    } else if (st.equals("STOPPED") || st.equals("NO_MEDIA_PRESENT")) {
+                        stopped++;
+                    }
+                } catch (IOException ignored) {
+                }
+            }
+        }, "telelink-track").start();
+    }
+
+    /** Salto relativo. En modo compatible la tele no sabe saltar: se reinicia el flujo en el punto nuevo. */
+    private String jump(Dlna.Device d, int delta) throws Exception {
+        Session ses = session;
+        if (ses != null && "compatible".equals(ses.how) && ses.target == d) {
+            int now = ses.offset + Dlna.position(this, d);
+            int to = Math.max(0, now + delta);
+            Dlna.play(this, d, ses.base + "/ts/" + ses.id + "/" + to + "/stream.ts", ses.title, "video/mpeg");
+            ses.offset = to;
+            return "Saltando a " + clock(to);
+        }
+        Dlna.seekBy(this, d, delta);
+        return null;
+    }
+
+    // ---------- Menú, favoritos e historial ----------
+
+    private JSONArray loadList(String key) {
+        try {
+            return new JSONArray(getSharedPreferences("lists", MODE_PRIVATE).getString(key, "[]"));
+        } catch (Exception e) {
+            return new JSONArray();
+        }
+    }
+
+    private void storeList(String key, JSONArray a) {
+        getSharedPreferences("lists", MODE_PRIVATE).edit().putString(key, a.toString()).apply();
+    }
+
+    private int indexOf(JSONArray a, String url) {
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o != null && url.equals(o.optString("u"))) return i;
+        }
+        return -1;
+    }
+
+    /** Pone la página la primera de la lista (sin repetirla) y recorta a un máximo. */
+    private void putFirst(String key, String title, String url, int max) {
+        try {
+            JSONArray old = loadList(key), out = new JSONArray();
+            JSONObject e = new JSONObject();
+            e.put("t", title == null || title.isEmpty() ? url : title);
+            e.put("u", url);
+            out.put(e);
+            for (int i = 0; i < old.length() && out.length() < max; i++) {
+                JSONObject o = old.optJSONObject(i);
+                if (o != null && !url.equals(o.optString("u"))) out.put(o);
+            }
+            storeList(key, out);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void addHistory(String title, String url) {
+        putFirst("history", title, url, 60);
+    }
+
+    private void showMenu() {
+        final String url = web.getUrl();
+        final boolean page = url != null && url.startsWith("http");
+        final boolean fav = page && indexOf(loadList("favorites"), url) >= 0;
+        String[] items = {
+                "Recargar",
+                fav ? "★ Quitar de favoritos" : "☆ Añadir a favoritos",
+                "Favoritos",
+                "Historial"
+        };
+        new AlertDialog.Builder(this)
+                .setItems(items, (d, which) -> {
+                    if (which == 0) {
+                        web.reload();
+                    } else if (which == 1) {
+                        if (!page) {
+                            toast("Abre primero una web");
+                        } else if (fav) {
+                            JSONArray a = loadList("favorites");
+                            int i = indexOf(a, url);
+                            if (i >= 0) a.remove(i);
+                            storeList("favorites", a);
+                            toast("Quitado de favoritos");
+                        } else {
+                            putFirst("favorites", web.getTitle(), url, 200);
+                            toast("Guardado en favoritos");
+                        }
+                    } else if (which == 2) {
+                        showList("favorites", "Favoritos", false);
+                    } else {
+                        showList("history", "Historial", false);
+                    }
+                })
+                .show();
+    }
+
+    /** Lista de páginas guardadas. En modo borrar, tocar una la quita en vez de abrirla. */
+    private void showList(final String key, final String title, final boolean deleting) {
+        final JSONArray a = loadList(key);
+        if (a.length() == 0) {
+            toast(title + ": no hay nada todavía");
+            return;
+        }
+        final SharedPreferences resume = getSharedPreferences("resume", MODE_PRIVATE);
+        String[] items = new String[a.length()];
+        for (int i = 0; i < items.length; i++) {
+            JSONObject o = a.optJSONObject(i);
+            String u = o == null ? "" : o.optString("u");
+            String t = o == null ? "" : o.optString("t");
+            int pos = resume.getInt(u, 0);
+            String host = Uri.parse(u).getHost();
+            items[i] = t + "\n" + (host == null ? u : host) + (pos >= 60 ? "  ·  vas por " + clock(pos) : "");
+        }
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle(deleting ? title + ": toca para quitar" : title)
+                .setItems(items, (d, which) -> {
+                    JSONObject o = a.optJSONObject(which);
+                    if (o == null) return;
+                    if (deleting) {
+                        a.remove(which);
+                        storeList(key, a);
+                        if (a.length() > 0) showList(key, title, true);
+                    } else {
+                        go(o.optString("u"));
+                    }
+                })
+                .setNegativeButton("Cerrar", null);
+        if (deleting) {
+            b.setNeutralButton("Borrar todo", (d, w) -> storeList(key, new JSONArray()));
+        } else {
+            b.setNeutralButton("Quitar…", (d, w) -> showList(key, title, true));
+        }
+        b.show();
     }
 
     private interface TvAction {
@@ -866,14 +1082,15 @@ public class MainActivity extends Activity {
         LinearLayout r2 = new LinearLayout(this);
         LinearLayout r3 = new LinearLayout(this);
 
-        addRemote(r1, "−30 s", d -> { Dlna.seekBy(this, d, -30); return null; });
+        addRemote(r1, "−30 s", d -> jump(d, -30));
         addRemote(r1, "Pausa", d -> { Dlna.pause(this, d); return null; });
         addRemote(r1, "Play", d -> { Dlna.resume(this, d); return null; });
-        addRemote(r1, "+30 s", d -> { Dlna.seekBy(this, d, 30); return null; });
+        addRemote(r1, "+30 s", d -> jump(d, 30));
 
         addRemote(r2, "Vol −", d -> "Volumen " + Dlna.volumeBy(this, d, -3));
         addRemote(r2, "Vol +", d -> "Volumen " + Dlna.volumeBy(this, d, 3));
-        addRemote(r2, "+5 min", d -> { Dlna.seekBy(this, d, 300); return null; });
+        addRemote(r2, "−5 min", d -> jump(d, -300));
+        addRemote(r2, "+5 min", d -> jump(d, 300));
 
         addRemote(r3, "Parar", d -> {
             sendSeq++;
