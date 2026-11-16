@@ -697,6 +697,7 @@ public class MainActivity extends Activity {
                 if (url != null && url.startsWith("http")) {
                     urlBar.setText(url);
                     currentPage = url;
+                    captchaZoomed = "";
                 }
             }
 
@@ -705,6 +706,9 @@ public class MainActivity extends Activity {
                 if (url != null && url.startsWith("http")) {
                     addHistory(view.getTitle(), url);
                     ui.postDelayed(() -> snap(), 2500);
+                    final String at = url;
+                    ui.postDelayed(() -> zoomCaptcha(at), 1200);
+                    ui.postDelayed(() -> zoomCaptcha(at), 4000);
                 }
                 if (!autoLockPending || url == null || !url.startsWith("http")) return;
                 autoLockPending = false;
@@ -714,6 +718,42 @@ public class MainActivity extends Activity {
                 setLock(baseDomain(host));
             }
         });
+    }
+
+    /** Busca un captcha en la página; devuelve cuánto hay que ampliar para que se pueda tocar. */
+    private static final String CAPTCHA_JS = "(function(){try{var e=document.querySelector("
+            + "'iframe[src*=\\'recaptcha\\'],iframe[src*=\\'hcaptcha\\'],iframe[src*=\\'turnstile\\'],"
+            + ".g-recaptcha,.h-captcha,.cf-turnstile');if(!e)return 0;var r=e.getBoundingClientRect();"
+            + "if(r.width<50)return 0;window.__tlCaptcha=e;"
+            + "var w=window.visualViewport?window.visualViewport.width:window.innerWidth;"
+            + "return 0.75*w/r.width;}catch(x){return 0;}})()";
+    private String captchaZoomed = "";
+
+    /**
+     * Las webs con diseño de ordenador salen en miniatura y el captcha no hay quien lo toque:
+     * se amplía la página hasta dejarlo a un tamaño cómodo y se centra. Resolverlo sigue siendo cosa tuya.
+     */
+    private void zoomCaptcha(final String url) {
+        if (url == null || !url.equals(currentPage) || url.equals(captchaZoomed)) return;
+        try {
+            web.evaluateJavascript(CAPTCHA_JS, v -> {
+                float f;
+                try {
+                    f = Float.parseFloat(v);
+                } catch (Exception e) {
+                    return;
+                }
+                if (!url.equals(currentPage) || url.equals(captchaZoomed)) return;
+                if (f <= 0) return;
+                captchaZoomed = url;
+                if (f < 1.3f) return; // ya se ve a buen tamaño
+                web.zoomBy(Math.min(f, 5f));
+                ui.postDelayed(() -> web.evaluateJavascript("(function(){try{window.__tlCaptcha.scrollIntoView("
+                        + "{block:'center',inline:'center'});}catch(x){}})()", null), 350);
+                toast("Captcha ampliado: resuélvelo y pulsa continuar");
+            });
+        } catch (Exception ignored) {
+        }
     }
 
     private void go(String text) {
