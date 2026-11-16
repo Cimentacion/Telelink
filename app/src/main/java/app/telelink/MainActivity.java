@@ -365,7 +365,7 @@ public class MainActivity extends Activity {
 
         Button back = bar("◀");
         back.setOnClickListener(v -> {
-            if (web.canGoBack()) web.goBack();
+            back();
         });
         bottom.addView(back, cell(0, dp(46), 1, 3));
 
@@ -784,6 +784,10 @@ public class MainActivity extends Activity {
                     adsAllowed = getSharedPreferences("noblock", MODE_PRIVATE)
                             .getBoolean(baseDomain(Uri.parse(url).getHost()), false);
                     view.evaluateJavascript(COMPAT_JS, null);
+                } else if (url != null && !currentPage.isEmpty() && !autoLockPending) {
+                    // Se ha vuelto a la portada por otro camino: vuelve a contar como portada.
+                    currentPage = "";
+                    urlBar.setText("");
                 }
             }
 
@@ -1985,9 +1989,35 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (!back()) super.onBackPressed();
+    }
+
+    /**
+     * Atrás. Si la página anterior es la portada, se vuelve a pintar entera en vez de sacar la copia
+     * vieja del historial: así sus botones (buscar, borrar, tarjetas) vuelven a funcionar y los
+     * recientes salen al día. false = ya no hay adónde volver.
+     */
+    private boolean back() {
         grabNow();
-        if (web.canGoBack()) web.goBack();
-        else super.onBackPressed();
+        if (!web.canGoBack()) return false;
+        try {
+            android.webkit.WebBackForwardList h = web.copyBackForwardList();
+            android.webkit.WebHistoryItem prev = h.getItemAtIndex(h.getCurrentIndex() - 1);
+            String u = prev == null ? null : prev.getUrl();
+            if (u == null || !u.startsWith("http")) {
+                setLock(null);
+                videos.clear();
+                videoHeaders.clear();
+                refreshVideos();
+                showHome();
+                web.clearHistory();
+                ui.postDelayed(() -> web.clearHistory(), 600); // la portada tarda un instante en cargar
+                return true;
+            }
+        } catch (Exception ignored) {
+        }
+        web.goBack();
+        return true;
     }
 
     @Override
