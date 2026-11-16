@@ -280,6 +280,11 @@ final class Dlna {
                     } catch (IOException ignored) {
                     }
                     pause(1500);
+                } else if (m.contains("UPnP 716")) {
+                    // La tele ha ido a por el vídeo y no se lo han dado: reintentar no sirve.
+                    throw new IOException("La tele no ha conseguido abrir el vídeo. Si lo has enviado en "
+                            + "«Directo», esta web no deja que la tele lo pida por su cuenta: usa Automático "
+                            + "o «Precargar en el móvil».\n\n" + m);
                 } else if (meta) {
                     meta = false; // algunas teles rechazan los metadatos: se prueba sin ellos
                 } else {
