@@ -99,8 +99,8 @@ public class MainActivity extends Activity {
     private static final int AUTO = 0, COMPAT = 1, DIRECT = 2;
     private static final String RELEASE = "https://github.com/Cimentacion/Telelink/releases/download/latest/";
     private static final String INSTALL = "app.telelink.INSTALL";
-    /** Guardar en el móvil es solo para clips cortos en archivo directo, no para vídeos largos. */
-    private static final long MAX_SAVE = 100L * 1024 * 1024;
+    /** Tamaño máximo de un archivo directo que se puede guardar en el móvil (1000 MB). */
+    private static final long MAX_SAVE = 1000L * 1024 * 1024;
     private boolean autoLockPending; // activar el candado en cuanto cargue la página pedida
 
     @Override
@@ -1225,8 +1225,8 @@ public class MainActivity extends Activity {
                 }
                 if (size <= 0) throw new IOException("No se puede comprobar el tamaño del archivo.");
                 if (size > MAX_SAVE) {
-                    throw new IOException("Ocupa " + (size / (1024 * 1024)) + " MB. Guardar es solo para clips cortos (máximo "
-                            + (MAX_SAVE / (1024 * 1024)) + " MB).");
+                    throw new IOException("Ocupa " + (size / (1024 * 1024)) + " MB. El máximo para guardar es de "
+                            + (MAX_SAVE / (1024 * 1024)) + " MB.");
                 }
 
                 String last = Uri.parse(url).getLastPathSegment();
