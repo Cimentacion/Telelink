@@ -1158,6 +1158,7 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             final List<Dlna.Device> found = Dlna.discover(MainActivity.this, 4000);
             ui.post(() -> {
+                if (isFinishing()) return;
                 wait.dismiss();
                 if (found.isEmpty()) {
                     new AlertDialog.Builder(MainActivity.this)
@@ -1193,6 +1194,7 @@ public class MainActivity extends Activity {
                     io.execute(() -> {
                         final List<Dlna.Device> found = Dlna.atIp(MainActivity.this, ip);
                         ui.post(() -> {
+                            if (isFinishing()) return;
                             wait.dismiss();
                             if (found.isEmpty()) {
                                 new AlertDialog.Builder(MainActivity.this)
@@ -1222,6 +1224,7 @@ public class MainActivity extends Activity {
                     if (!sending) sendLabel();
                     if (then != null) then.run();
                 })
+                .setNeutralButton("Escribir la IP", (d, w) -> askTvIp(then))
                 .setNegativeButton("Cancelar", null)
                 .show();
     }
